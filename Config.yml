@@ -1,6 +1,6 @@
-block_headers:
+blocked_headers:
   - User-Agent
   - X-Forwarded-For
-block_params:
+blocked_params:
   - access_token
   - secret_key

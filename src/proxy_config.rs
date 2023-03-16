@@ -4,9 +4,10 @@ use std::io::Read;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ProxyConfig {
-    block_headers: Option<Vec<String>>,
-    block_params: Option<Vec<String>>,
-    mask_params: Vec<String>,
+    pub blocked_headers: Option<Vec<String>>,
+    pub blocked_params: Option<Vec<String>>,
+    pub additional_headers: Option<Vec<(String, String)>>,
+    pub mask_params: Vec<String>,
 }
 
 impl ProxyConfig {
