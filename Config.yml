@@ -1,0 +1,6 @@
+block_headers:
+  - User-Agent
+  - X-Forwarded-For
+block_params:
+  - access_token
+  - secret_key
