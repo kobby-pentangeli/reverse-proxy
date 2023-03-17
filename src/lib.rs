@@ -1,12 +1,10 @@
 use hyper::{http::header::HeaderName, Body, Client, Method, Request, Response, StatusCode};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::io::Read;
 use std::sync::Arc;
 
-/// Representation of client config information,
-/// parsed from the provided configuration file.
-#[derive(Debug, Serialize, Deserialize)]
+/// Represents client config information parsed from the provided configuration file.
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Config {
     /// A set of headers that we want to remove from incoming requests
     pub blocked_headers: Option<Vec<String>>,
@@ -17,23 +15,21 @@ pub struct Config {
 }
 
 impl Config {
+    /// Load the client configuration from a file.
     pub fn load_from_file(file_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut file = match std::fs::File::open(file_path) {
+        let file = match std::fs::File::open(file_path) {
             Ok(file) => file,
             Err(err) => return Err(format!("Failed to open config file: {}", err).into()),
         };
+        let yaml_val: serde_yaml::Value = serde_yaml::from_reader(file)?;
 
-        let mut buf = String::new();
-        if let Err(err) = file.read_to_string(&mut buf) {
-            return Err(format!("Failed to read config file: {}", err).into());
-        }
-
-        match serde_json::from_str(&buf) {
+        match serde_yaml::from_value(yaml_val) {
             Ok(config) => Ok(config),
             Err(err) => Err(format!("Failed to deserialize config file: {}", err).into()),
         }
     }
 
+    /// Inspect the response body for any sensitive data and mask it.
     pub fn mask_sensitive_data(&self, data: &str) -> Result<String, Box<dyn std::error::Error>> {
         let mut masked_data = data.to_owned();
         for param in &self.masked_params {
@@ -112,9 +108,92 @@ pub async fn handle_request(
     log::info!("Outgoing request:\n{:#?}", &proxy_req);
     let res = client.request(proxy_req).await?;
     // Inspect the response body for any sensitive data and mask it before forwarding
-    let masked_body = config.mask_sensitive_data(&format!("{:?}", &res.body()))?;
+    let masked_body = config.mask_sensitive_data(&format!("{:?}", &res.into_body()))?;
     let response = Response::new(Body::from(masked_body));
     log::info!("Response:\n{:#?}", &response);
 
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_load_from_file() -> Result<(), Box<dyn std::error::Error>> {
+        let config = Config::load_from_file("./Config.yml")?;
+        assert_eq!(
+            config.blocked_headers,
+            Some(vec![
+                "User-Agent".to_string(),
+                "X-Forwarded-For".to_string()
+            ])
+        );
+        assert_eq!(
+            config.blocked_params,
+            Some(vec!["access_token".to_string(), "secret_key".to_string()])
+        );
+        assert_eq!(
+            config.masked_params,
+            vec![
+                "password".to_string(),
+                "ssn".to_string(),
+                "credit_card".to_string()
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_mask_sensitive_data() -> Result<(), Box<dyn std::error::Error>> {
+        let config = Config {
+            masked_params: vec!["password".to_string(), "token".to_string()],
+            ..Default::default()
+        };
+        let data = "username=john&password=secret&token=1234567890";
+        let masked_data = config.mask_sensitive_data(data)?;
+        assert_eq!(masked_data, "username=john&password=****&token=****");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_blocked_headers() -> Result<(), Box<dyn std::error::Error>> {
+        let config = Config {
+            blocked_headers: Some(vec!["X-Forwarded-For".to_string()]),
+            ..Default::default()
+        };
+        let req = Request::builder()
+            .uri("http://www.rust-lang.org/")
+            .body(Body::empty())?;
+
+        let res = handle_request(req, Arc::new(config)).await?;
+        assert_eq!(res.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_blocked_params() -> Result<(), Box<dyn std::error::Error>> {
+        let config = Config {
+            blocked_params: Some(vec!["password".to_string()]),
+            ..Default::default()
+        };
+        let req = Request::builder()
+            .uri("http://www.rust-lang.org/login?username=john&password=secret")
+            .body(Body::empty())?;
+        let res = handle_request(req, Arc::new(config)).await?;
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_no_blocked_headers_or_params(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let config = Config::default();
+        let req = Request::builder()
+            .uri("http://www.rust-lang.org/")
+            .body(Body::empty())?;
+        let res = handle_request(req, Arc::new(config)).await?;
+        assert_eq!(res.status(), StatusCode::OK);
+        Ok(())
+    }
 }

@@ -6,4 +6,5 @@ blocked_params:
   - secret_key
 masked_params:
   - password
-  - email
+  - ssn
+  - credit_card
