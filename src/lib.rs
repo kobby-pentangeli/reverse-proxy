@@ -1,3 +1,65 @@
+//!
+//! A simple HTTP server acting as a reverse proxy, to be used with [Hyper].
+//!
+//! [Hyper]: https://hyper.rs/
+//!
+//! # Example
+//!
+//! 1. Define a `Config.yml` file at the root of your project, with content like:
+//!
+//! ```yml
+//! blocked_headers:
+//!  - User-Agent
+//!  - X-Forwarded-For
+//! blocked_params:
+//!  - access_token
+//!  - secret_key
+//! masked_params:
+//!  - password
+//!  - ssn
+//!  - credit_card
+//! ```
+//!
+//! 2. Add these dependencies to your `Cargo.toml` file:
+//!
+//! ```toml
+//! [dependencies]
+//! reverse-proxy = "0.1.0"
+//! hyper = { version = "0.14", features = ["full"] }
+//! tokio = { version = "1", features = ["full"] }
+//! ```
+//!
+//! 3. In `src/main.rs`, create a new HTTP server that uses our proxy as its request handler:
+//!
+//! ```rust,ignore
+//! use hyper::{Body, Request, Server};
+//! use std::{convert::Infallible, net::SocketAddr};
+//! use std::net::IpAddr;
+//! use std::sync::Arc;
+//!
+//! use reverse_proxy::{Config, handle_request};
+//!
+//! fn main() {
+//!     let config = Arc::new(Config::from_file("./Config.yml"));
+//!     let addr: SocketAddr = ([127, 0, 0, 1], 8080).into();
+//!
+//!     let server = Server::bind(&addr).serve(move || {
+//!         let config = config.clone();
+//!
+//!         async {
+//!             Ok::<_, hyper::Error>(hyper::service::service_fn(move |req: Request<Body>| {
+//!                 handle_request(req, config.clone())
+//!             }))
+//!         }
+//!     });
+//!
+//!     println!("Listening on http://{}", addr);
+//!
+//!     hyper::rt::run(server);
+//! }
+//! ```
+//!
+
 use hyper::{http::header::HeaderName, Body, Client, Method, Request, Response, StatusCode};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -42,6 +104,7 @@ impl Config {
     }
 }
 
+/// Handle an incoming request.
 pub async fn handle_request(
     req: Request<Body>,
     config: Arc<Config>,
