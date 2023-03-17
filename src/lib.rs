@@ -8,14 +8,14 @@ use std::io::Read;
 use std::sync::Arc;
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ProxyConfig {
+pub struct Config {
     pub blocked_headers: Option<Vec<String>>,
     pub blocked_params: Option<Vec<String>>,
     pub additional_headers: Option<Vec<(String, String)>>,
     pub mask_params: Vec<String>,
 }
 
-impl ProxyConfig {
+impl Config {
     pub fn load_from_file(file_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let mut file = match std::fs::File::open(file_path) {
             Ok(file) => file,
@@ -47,7 +47,7 @@ impl ProxyConfig {
 
 pub async fn handle_request(
     req: Request<Body>,
-    config: Arc<ProxyConfig>,
+    config: Arc<Config>,
 ) -> Result<Response<Body>, Box<dyn std::error::Error>> {
     let uri = req.uri();
 
