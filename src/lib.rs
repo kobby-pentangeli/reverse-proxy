@@ -1,18 +1,22 @@
 use hyper::{
     http::header::{HeaderName, HeaderValue},
-    Body, Client, Method, Request, Response,
+    Body, Client, Method, Request, Response, StatusCode,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::sync::Arc;
 
+/// Representation of client config information,
+/// parsed from the provided configuration file.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
+    /// A set of headers that we want to remove from incoming requests
     pub blocked_headers: Option<Vec<String>>,
+    /// A set of rules for blocking requests based on request headers or body content
     pub blocked_params: Option<Vec<String>>,
-    pub additional_headers: Option<Vec<(String, String)>>,
-    pub mask_params: Vec<String>,
+    /// Sensitive information we want to mask before forwarding
+    pub masked_params: Vec<String>,
 }
 
 impl Config {
@@ -33,15 +37,15 @@ impl Config {
         }
     }
 
-    pub fn mask_response_body(&self, body: &str) -> String {
-        let mut masked_body = body.to_owned();
-        for param in &self.mask_params {
-            let re = Regex::new(&format!("{}=([^&]+)", param)).unwrap();
-            masked_body = re
-                .replace_all(&masked_body, &format!("{}=****", param))
+    pub fn mask_sensitive_data(&self, data: &str) -> Result<String, Box<dyn std::error::Error>> {
+        let mut masked_data = data.to_owned();
+        for param in &self.masked_params {
+            let re = Regex::new(&format!("{}=([^&]+)", param))?;
+            masked_data = re
+                .replace_all(&masked_data, &format!("{}=****", param))
                 .to_string();
         }
-        masked_body
+        Ok(masked_data)
     }
 }
 
@@ -49,12 +53,13 @@ pub async fn handle_request(
     req: Request<Body>,
     config: Arc<Config>,
 ) -> Result<Response<Body>, Box<dyn std::error::Error>> {
+    log::info!("Incoming request:\n{:#?}", &req);
     let uri = req.uri();
 
     // Only inspect `GET` requests
     if req.method() != &Method::GET {
         return Ok(Response::builder()
-            .status(400)
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
             .body(Body::from("Only GET requests are supported"))?);
     }
 
@@ -62,12 +67,14 @@ pub async fn handle_request(
     let headers = req.headers().clone();
     if let Some(blocked_headers) = &config.blocked_headers {
         for header in blocked_headers.iter() {
-            let header_name = HeaderName::from_bytes(header.as_bytes()).unwrap();
+            let header_name = HeaderName::from_bytes(header.as_bytes())?;
             if headers.contains_key(&header_name) {
-                return Ok(Response::builder().status(400).body(Body::from(format!(
-                    "Blocked request because it contains the blocked header: {}",
-                    header
-                )))?);
+                return Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::from(format!(
+                        "Blocked request because it contains the blocked header: {}",
+                        header
+                    )))?);
             }
         }
     }
@@ -78,10 +85,12 @@ pub async fn handle_request(
         for param in blocked_params.iter() {
             let blocked_param = format!("{}=", param);
             if params.contains(&blocked_param) {
-                return Ok(Response::builder().status(400).body(Body::from(format!(
-                    "Blocked request because it contains the blocked parameter: {}",
-                    param
-                )))?);
+                return Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::from(format!(
+                        "Blocked request because it contains the blocked parameter: {}",
+                        param
+                    )))?);
             }
         }
     }
@@ -93,25 +102,22 @@ pub async fn handle_request(
     *proxy_req.uri_mut() = req.uri().clone();
 
     let headers = proxy_req.headers_mut();
-    for (name, value) in headers.iter_mut() {
+    for (name, value) in headers.iter() {
         // Remove any headers that were blocked
         if let Some(blocked_headers) = &config.blocked_headers {
             if blocked_headers.contains(&name.as_str().to_string()) {
-                headers.remove(name).unwrap();
-            }
-        }
-        // Add any additional headers specified in the config
-        if let Some(add_headers) = &config.additional_headers {
-            for (header_name, header_value) in add_headers.iter() {
-                let header_name = HeaderName::from_bytes(header_name.as_bytes()).unwrap();
-                let header_value = HeaderValue::from_str(header_value).unwrap();
-                headers.insert(header_name, header_value);
+                headers.remove(name);
             }
         }
     }
 
     // Send the modified request to the destination server and return the response
-    let mut res = client.request(proxy_req).await?;
-    let body = std::mem::replace(res.body_mut(), Body::empty());
-    Ok(Response::new(body))
+    log::info!("Outgoing request:\n{:#?}", &proxy_req);
+    let res = client.request(proxy_req).await?;
+    // Inspect the response body for any sensitive data and mask it before forwarding
+    let masked_body = config.mask_sensitive_data(&format!("{:?}", &res.body()))?;
+    let response = Response::new(Body::from(masked_body));
+    log::info!("Response:\n{:#?}", &response);
+
+    Ok(response)
 }

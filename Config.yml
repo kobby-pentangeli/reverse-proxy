@@ -4,3 +4,6 @@ blocked_headers:
 blocked_params:
   - access_token
   - secret_key
+masked_params:
+  - password
+  - email
