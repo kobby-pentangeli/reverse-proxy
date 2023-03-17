@@ -1,7 +1,4 @@
-use hyper::{
-    http::header::{HeaderName, HeaderValue},
-    Body, Client, Method, Request, Response, StatusCode,
-};
+use hyper::{http::header::HeaderName, Body, Client, Method, Request, Response, StatusCode};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
@@ -57,10 +54,10 @@ pub async fn handle_request(
     let uri = req.uri();
 
     // Only inspect `GET` requests
-    if req.method() != &Method::GET {
+    if req.method() != Method::GET {
         return Ok(Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .body(Body::from("Only GET requests are supported"))?);
+            .body(Body::from("Only GET requests are inspected"))?);
     }
 
     // Check if any blocked headers are present
@@ -102,7 +99,7 @@ pub async fn handle_request(
     *proxy_req.uri_mut() = req.uri().clone();
 
     let headers = proxy_req.headers_mut();
-    for (name, value) in headers.iter() {
+    for (name, _value) in headers.clone().iter() {
         // Remove any headers that were blocked
         if let Some(blocked_headers) = &config.blocked_headers {
             if blocked_headers.contains(&name.as_str().to_string()) {
