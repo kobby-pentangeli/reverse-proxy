@@ -3,6 +3,8 @@ name = "reverse-proxy"
 version = "0.1.0"
 description = "An implementation of a simple HTTP server acting as a reverse proxy."
 authors = ["Kobby Pentangeli <kobbypentangeli@gmail.com>"]
+repository = "https://github.com/kobby-pentangeli/reverse-proxy"
+readme = "README.md"
 license = "MIT"
 edition = "2021"
 
