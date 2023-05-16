@@ -2,6 +2,42 @@
 
 An implementation of a simple HTTP server acting as a reverse proxy.
 
+## Setup & Run
+
+1. Clone the repo && cd:
+
+```bash
+git clone https://github.com/kobby-pentangeli/reverse-proxy.git
+cd reverse-proxy
+```
+
+2. Define and/or edit the `Config.yml` file at the root of the project:
+
+```yml
+blocked_headers:
+  - User-Agent
+  - X-Forwarded-For
+blocked_params:
+  - access_token
+  - secret_key
+masked_params:
+  - password
+  - ssn
+  - credit_card
+```
+
+3. Run the server:
+
+```bash
+cargo run
+```
+
+4. In a new terminal, send a request:
+
+```bash
+curl -i http://127.0.0.1:8100/
+```
+
 ## Background
 
 A startup needs a reverse proxy to help in data governance. We need to create a simple HTTP server that will act as a reverse proxy. The proxy should be able to handle incoming requests, inspect the request headers, and then forward the requests to the intended destination. In addition, the proxy should be able to log all incoming requests, including the headers and body, and the response headers and body. The proxy should also be able to block certain requests based on a set of predefined rules.
