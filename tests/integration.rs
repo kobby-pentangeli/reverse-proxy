@@ -6,6 +6,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use hyper::service::{make_service_fn, service_fn};
@@ -593,4 +594,92 @@ async fn response_strips_internal_and_hop_by_hop_headers() {
         "keep-alive hop-by-hop header should be stripped"
     );
     assert!(resp.headers().contains_key("content-type"));
+}
+
+/// Starts a backend that sleeps for the given duration before responding.
+async fn start_slow_backend(delay: Duration) -> (SocketAddr, oneshot::Sender<()>) {
+    let (tx, rx) = oneshot::channel::<()>();
+
+    let make_svc = make_service_fn(move |_| {
+        let delay = delay;
+        async move {
+            Ok::<_, std::convert::Infallible>(service_fn(move |_req: Request<Body>| {
+                let delay = delay;
+                async move {
+                    tokio::time::sleep(delay).await;
+                    Ok::<_, std::convert::Infallible>(
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "text/plain")
+                            .body(Body::from("slow"))
+                            .expect("test response must build"),
+                    )
+                }
+            }))
+        }
+    });
+
+    let server = Server::bind(&SocketAddr::from(([127, 0, 0, 1], 0))).serve(make_svc);
+    let addr = server.local_addr();
+
+    tokio::spawn(async move {
+        let graceful = server.with_graceful_shutdown(async {
+            let _ = rx.await;
+        });
+        let _ = graceful.await;
+    });
+
+    (addr, tx)
+}
+
+/// Builds a `RuntimeConfig` with a short request timeout for testing.
+fn test_config_with_timeout(addr: SocketAddr, timeout_ms: u64) -> Arc<RuntimeConfig> {
+    Arc::new(
+        Config {
+            upstream: format!("http://{addr}"),
+            request_timeout_ms: Some(timeout_ms),
+            ..Default::default()
+        }
+        .into_runtime()
+        .expect("test config must be valid"),
+    )
+}
+
+#[tokio::test]
+async fn request_timeout_returns_504() {
+    init_tracing();
+    let (addr, _shutdown) = start_slow_backend(Duration::from_secs(5)).await;
+    let config = test_config_with_timeout(addr, 100);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("http://{addr}/"))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = handle_request(req, test_client(), config, test_addr())
+        .await
+        .unwrap_err()
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+}
+
+#[tokio::test]
+async fn request_within_timeout_succeeds() {
+    init_tracing();
+    let (addr, _shutdown) = start_slow_backend(Duration::from_millis(10)).await;
+    let config = test_config_with_timeout(addr, 5000);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("http://{addr}/"))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = handle_request(req, test_client(), config, test_addr())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+    assert_eq!(body, Bytes::from("slow"));
 }

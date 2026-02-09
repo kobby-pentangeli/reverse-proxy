@@ -6,6 +6,7 @@
 //! request time.
 
 use std::path::Path;
+use std::time::Duration;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -14,6 +15,22 @@ use crate::{ProxyError, Result};
 
 /// Default maximum request body size: 10 MiB.
 pub const DEFAULT_MAX_BODY_SIZE: u64 = 10 * 1024 * 1024;
+
+/// Default connect timeout for establishing upstream TCP connections.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default total request timeout covering the entire upstream round-trip.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default idle timeout for pooled connections before they are closed.
+pub const DEFAULT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Default maximum number of idle connections kept per upstream host.
+pub const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 32;
+
+/// Default maximum number of concurrent in-flight requests the proxy
+/// will handle before returning 503 Service Unavailable.
+pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 1000;
 
 /// Raw configuration as deserialized from the YAML file.
 ///
@@ -41,6 +58,24 @@ pub struct Config {
     /// Typically `["server", "x-powered-by"]` to hide backend details.
     #[serde(default)]
     pub strip_response_headers: Vec<String>,
+    /// Connect timeout in milliseconds for establishing upstream TCP connections
+    /// (default: 5000).
+    #[serde(default)]
+    pub connect_timeout_ms: Option<u64>,
+    /// Total request timeout in milliseconds covering the entire upstream
+    /// round-trip (default: 30000). Requests exceeding this receive 504.
+    #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
+    /// Idle timeout in milliseconds for pooled connections (default: 60000).
+    #[serde(default)]
+    pub pool_idle_timeout_ms: Option<u64>,
+    /// Maximum idle connections kept per upstream host (default: 32).
+    #[serde(default)]
+    pub pool_max_idle_per_host: Option<usize>,
+    /// Maximum concurrent in-flight requests before returning 503
+    /// Service Unavailable (default: 1000).
+    #[serde(default)]
+    pub max_concurrent_requests: Option<usize>,
 }
 
 /// Fully validated, ready-to-use configuration with pre-compiled patterns.
@@ -64,6 +99,16 @@ pub struct RuntimeConfig {
     /// Lowercased response header names to strip before returning to the
     /// client (e.g. `"server"`, `"x-powered-by"`).
     pub strip_response_headers: Vec<String>,
+    /// Connect timeout for upstream TCP connections.
+    pub connect_timeout: Duration,
+    /// Total request timeout for the upstream round-trip. Expiry yields 504.
+    pub request_timeout: Duration,
+    /// Idle timeout for pooled upstream connections.
+    pub pool_idle_timeout: Duration,
+    /// Maximum idle connections per upstream host.
+    pub pool_max_idle_per_host: usize,
+    /// Maximum concurrent in-flight requests. Overflow yields 503.
+    pub max_concurrent_requests: usize,
 }
 
 /// A single pre-compiled masking rule binding a parameter name to its regex.
@@ -142,6 +187,26 @@ impl Config {
             .map(|h| h.to_ascii_lowercase())
             .collect();
 
+        let connect_timeout = self
+            .connect_timeout_ms
+            .map_or(DEFAULT_CONNECT_TIMEOUT, Duration::from_millis);
+
+        let request_timeout = self
+            .request_timeout_ms
+            .map_or(DEFAULT_REQUEST_TIMEOUT, Duration::from_millis);
+
+        let pool_idle_timeout = self
+            .pool_idle_timeout_ms
+            .map_or(DEFAULT_POOL_IDLE_TIMEOUT, Duration::from_millis);
+
+        let pool_max_idle_per_host = self
+            .pool_max_idle_per_host
+            .unwrap_or(DEFAULT_POOL_MAX_IDLE_PER_HOST);
+
+        let max_concurrent_requests = self
+            .max_concurrent_requests
+            .unwrap_or(DEFAULT_MAX_CONCURRENT_REQUESTS);
+
         Ok(RuntimeConfig {
             upstream,
             blocked_headers,
@@ -149,6 +214,11 @@ impl Config {
             mask_rules,
             max_body_size,
             strip_response_headers,
+            connect_timeout,
+            request_timeout,
+            pool_idle_timeout,
+            pool_max_idle_per_host,
+            max_concurrent_requests,
         })
     }
 }
@@ -183,6 +253,11 @@ mod tests {
         );
         assert_eq!(config.blocked_params, vec!["access_token", "secret_key"]);
         assert_eq!(config.masked_params, vec!["password", "ssn", "credit_card"]);
+        assert_eq!(config.connect_timeout_ms, Some(5000));
+        assert_eq!(config.request_timeout_ms, Some(30000));
+        assert_eq!(config.pool_idle_timeout_ms, Some(60000));
+        assert_eq!(config.pool_max_idle_per_host, Some(32));
+        assert_eq!(config.max_concurrent_requests, Some(1000));
     }
 
     #[test]

@@ -54,6 +54,17 @@ pub enum ProxyError {
     #[error("invalid header name: {0}")]
     InvalidHeaderName(#[from] hyper::header::InvalidHeaderName),
 
+    /// The upstream request exceeded the configured timeout.
+    #[error("upstream request timed out after {0:?}")]
+    Timeout(std::time::Duration),
+
+    /// The proxy has reached its maximum concurrent request capacity.
+    #[error("service at capacity: {limit} concurrent requests")]
+    ServiceUnavailable {
+        /// The configured concurrency ceiling.
+        limit: usize,
+    },
+
     /// An internal error that does not fit other categories.
     #[error("internal error: {0}")]
     Internal(String),
@@ -73,6 +84,8 @@ impl ProxyError {
             Self::BodyTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Self::RequestSmuggling => StatusCode::BAD_REQUEST,
             Self::Upstream(_) => StatusCode::BAD_GATEWAY,
+            Self::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
+            Self::ServiceUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -115,6 +128,8 @@ impl ProxyError {
             Self::BodyTooLarge { .. } => "body_too_large",
             Self::RequestSmuggling => "request_smuggling",
             Self::Upstream(_) => "upstream_error",
+            Self::Timeout(_) => "gateway_timeout",
+            Self::ServiceUnavailable { .. } => "service_unavailable",
             Self::Http(_) | Self::InvalidHeaderValue(_) | Self::InvalidHeaderName(_) => {
                 "http_error"
             }

@@ -3,8 +3,9 @@ use std::sync::Arc;
 
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Client, Response, Server};
-use reverse_proxy::{Config, handle_request};
-use tracing::{error, info};
+use reverse_proxy::{Config, ProxyError, handle_request};
+use tokio::sync::Semaphore;
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 const CONFIG_FILE_PATH: &str = "./Config.yml";
@@ -31,8 +32,14 @@ async fn main() {
         blocked_params = config.blocked_params.len(),
         mask_rules = config.mask_rules.len(),
         max_body_size = config.max_body_size,
+        connect_timeout = ?config.connect_timeout,
+        request_timeout = ?config.request_timeout,
+        max_concurrent_requests = config.max_concurrent_requests,
         "configuration loaded"
     );
+
+    let semaphore = Arc::new(Semaphore::new(config.max_concurrent_requests));
+    let concurrency_limit = config.max_concurrent_requests;
 
     let config = Arc::new(config);
     let addr = SocketAddr::from(([127, 0, 0, 1], 8100));
@@ -40,17 +47,37 @@ async fn main() {
     let client = Client::builder()
         .http1_title_case_headers(true)
         .http1_preserve_header_case(true)
+        .pool_idle_timeout(config.pool_idle_timeout)
+        .pool_max_idle_per_host(config.pool_max_idle_per_host)
         .build_http();
 
     let make_service = make_service_fn(move |conn: &hyper::server::conn::AddrStream| {
         let client = client.clone();
         let config = Arc::clone(&config);
+        let semaphore = Arc::clone(&semaphore);
         let client_addr = conn.remote_addr();
         async move {
             Ok::<_, std::convert::Infallible>(service_fn(move |req| {
                 let client = client.clone();
                 let config = Arc::clone(&config);
+                let semaphore = Arc::clone(&semaphore);
                 async move {
+                    let _permit = match semaphore.try_acquire() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            warn!(
+                                limit = concurrency_limit,
+                                "concurrency limit reached, rejecting request"
+                            );
+                            let err = ProxyError::ServiceUnavailable {
+                                limit: concurrency_limit,
+                            };
+                            return Ok::<Response<Body>, std::convert::Infallible>(
+                                err.into_response(),
+                            );
+                        }
+                    };
+
                     let resp = handle_request(req, client, config, client_addr)
                         .await
                         .unwrap_or_else(|e| e.into_response());
@@ -67,7 +94,35 @@ async fn main() {
 
     info!(%addr, "listening");
 
-    if let Err(e) = server.await {
+    let graceful = server.with_graceful_shutdown(shutdown_signal());
+
+    if let Err(e) = graceful.await {
         error!(%e, "server terminated with error");
+    }
+
+    info!("shutdown complete");
+}
+
+/// Awaits a shutdown signal (SIGINT or SIGTERM on Unix, Ctrl+C on all
+/// platforms). Once received, the server stops accepting new connections
+/// and drains in-flight requests before exiting.
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
+
+        tokio::select! {
+            _ = ctrl_c => info!("received SIGINT, initiating graceful shutdown"),
+            _ = sigterm.recv() => info!("received SIGTERM, initiating graceful shutdown"),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await.expect("failed to listen for Ctrl+C");
+        info!("received Ctrl+C, initiating graceful shutdown");
     }
 }

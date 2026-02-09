@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 use hyper::header::HeaderName;
 use hyper::{Body, Client, Method, Request, Response, Uri};
+use tokio::time::timeout;
 use tracing::{Instrument, debug, info, warn};
 
 use crate::{ProxyError, Result, RuntimeConfig, headers};
@@ -128,17 +129,26 @@ pub async fn handle_request(
 
         let start = std::time::Instant::now();
         let proxy_req = Request::from_parts(parts, body);
-        let upstream_result = client.request(proxy_req).await;
+
+        let upstream_result = timeout(config.request_timeout, client.request(proxy_req)).await;
 
         let mut upstream_resp = match upstream_result {
-            Ok(resp) => resp,
-            Err(e) => {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
                 warn!(
                     error = %e,
                     latency_ms = start.elapsed().as_millis() as u64,
                     "upstream request failed"
                 );
                 return Err(ProxyError::Upstream(e));
+            }
+            Err(_elapsed) => {
+                warn!(
+                    timeout = ?config.request_timeout,
+                    latency_ms = start.elapsed().as_millis() as u64,
+                    "upstream request timed out"
+                );
+                return Err(ProxyError::Timeout(config.request_timeout));
             }
         };
 

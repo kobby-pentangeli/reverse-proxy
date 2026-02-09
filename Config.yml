@@ -13,3 +13,8 @@ max_body_size: 10485760
 strip_response_headers:
   - server
   - x-powered-by
+connect_timeout_ms: 5000
+request_timeout_ms: 30000
+pool_idle_timeout_ms: 60000
+pool_max_idle_per_host: 32
+max_concurrent_requests: 1000
