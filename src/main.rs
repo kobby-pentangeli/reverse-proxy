@@ -24,15 +24,16 @@ async fn main() {
         .http1_preserve_header_case(true)
         .build_http();
 
-    let make_service = make_service_fn(move |_| {
+    let make_service = make_service_fn(move |conn: &hyper::server::conn::AddrStream| {
         let client = client.clone();
         let config = Arc::clone(&config);
+        let client_addr = conn.remote_addr();
         async move {
             Ok::<_, std::convert::Infallible>(service_fn(move |req| {
                 let client = client.clone();
                 let config = Arc::clone(&config);
                 async move {
-                    let resp = handle_request(req, client, config)
+                    let resp = handle_request(req, client, config, client_addr)
                         .await
                         .unwrap_or_else(|e| e.into_response());
                     Ok::<Response<Body>, std::convert::Infallible>(resp)

@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ProxyError, Result};
 
+/// Default maximum request body size: 10 MiB.
+pub const DEFAULT_MAX_BODY_SIZE: u64 = 10 * 1024 * 1024;
+
 /// Raw configuration as deserialized from the YAML file.
 ///
 /// This struct maps directly to the on-disk schema. After loading, it is
@@ -30,15 +33,14 @@ pub struct Config {
     /// Parameter names whose values are masked in response bodies.
     #[serde(default)]
     pub masked_params: Vec<String>,
-}
-
-/// A single pre-compiled masking rule binding a parameter name to its regex.
-#[derive(Debug, Clone)]
-pub struct MaskRule {
-    /// The original parameter name this rule applies to.
-    pub param: String,
-    /// Compiled regex matching `{param}={value}` in query-string-style text.
-    pub pattern: Regex,
+    /// Maximum allowed request body size in bytes (default: 10 MiB).
+    /// Requests with a `Content-Length` exceeding this limit receive 413.
+    #[serde(default)]
+    pub max_body_size: Option<u64>,
+    /// Response header names to strip before returning to the client.
+    /// Typically `["server", "x-powered-by"]` to hide backend details.
+    #[serde(default)]
+    pub strip_response_headers: Vec<String>,
 }
 
 /// Fully validated, ready-to-use configuration with pre-compiled patterns.
@@ -56,6 +58,21 @@ pub struct RuntimeConfig {
     pub blocked_params: Vec<String>,
     /// Pre-compiled masking rules for response body inspection.
     pub mask_rules: Vec<MaskRule>,
+    /// Maximum request body size in bytes. Requests whose `Content-Length`
+    /// exceeds this threshold are rejected with 413 Payload Too Large.
+    pub max_body_size: u64,
+    /// Lowercased response header names to strip before returning to the
+    /// client (e.g. `"server"`, `"x-powered-by"`).
+    pub strip_response_headers: Vec<String>,
+}
+
+/// A single pre-compiled masking rule binding a parameter name to its regex.
+#[derive(Debug, Clone)]
+pub struct MaskRule {
+    /// The original parameter name this rule applies to.
+    pub param: String,
+    /// Compiled regex matching `{param}={value}` in query-string-style text.
+    pub pattern: Regex,
 }
 
 impl Config {
@@ -117,11 +134,21 @@ impl Config {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        let max_body_size = self.max_body_size.unwrap_or(DEFAULT_MAX_BODY_SIZE);
+
+        let strip_response_headers = self
+            .strip_response_headers
+            .into_iter()
+            .map(|h| h.to_ascii_lowercase())
+            .collect();
+
         Ok(RuntimeConfig {
             upstream,
             blocked_headers,
             blocked_params: self.blocked_params,
             mask_rules,
+            max_body_size,
+            strip_response_headers,
         })
     }
 }

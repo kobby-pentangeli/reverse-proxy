@@ -1,12 +1,18 @@
 //! Core proxy handler: request forwarding, body streaming, and filtering.
+//!
+//! Implements the full proxy pipeline including HTTP spec compliance
+//! (hop-by-hop header stripping, forwarding headers, request smuggling
+//! defense) and policy enforcement (header/param blocking, body size
+//! limits, response masking).
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use hyper::header::HeaderName;
 use hyper::{Body, Client, Method, Request, Response, Uri};
 
-use crate::{ProxyError, Result, RuntimeConfig};
+use crate::{ProxyError, Result, RuntimeConfig, headers};
 
 /// The HTTP client type used for upstream connections.
 pub type HttpClient = Client<hyper::client::HttpConnector>;
@@ -15,42 +21,83 @@ pub type HttpClient = Client<hyper::client::HttpConnector>;
 ///
 /// The pipeline performs the following steps in order:
 ///
-/// 1. **GET inspection** — If the request method is GET, blocked headers and
+/// 1. **Request smuggling defense** — Rejects requests carrying both
+///    `Content-Length` and `Transfer-Encoding` headers (RFC 7230 §3.3.3).
+/// 2. **Body size enforcement** — Rejects requests whose `Content-Length`
+///    exceeds the configured `max_body_size` with 413 Payload Too Large.
+/// 3. **GET inspection** — If the request method is GET, blocked headers and
 ///    query parameters are checked. Requests matching any block rule receive
 ///    a 403 Forbidden response.
-/// 2. **URI rewriting** — The request URI is rewritten to target the configured
+/// 4. **Hop-by-hop stripping** — Connection-scoped headers are removed
+///    before forwarding, per RFC 7230 §6.1.
+/// 5. **Forwarding headers** — `X-Forwarded-For`, `X-Forwarded-Proto`, and
+///    `X-Forwarded-Host` are injected to preserve client origin metadata.
+/// 6. **Host rewriting** — The `Host` header is set to the upstream authority.
+/// 7. **URI rewriting** — The request URI is rewritten to target the configured
 ///    upstream, preserving the original path and query string.
-/// 3. **Header forwarding** — Original request headers are carried through,
-///    with blocked headers stripped from the outgoing request.
-/// 4. **Body streaming** — The request body is passed through to the upstream
+/// 8. **Body streaming** — The request body is passed through to the upstream
 ///    without buffering.
-/// 5. **Response masking** — For text-based upstream responses, sensitive
-///    parameter values are masked before returning to the client.
-///
-/// Non-GET methods skip the blocking inspection entirely and are forwarded
-/// directly to the upstream.
+/// 9. **Response hop-by-hop stripping** — Connection-scoped headers are
+///    removed from the upstream response.
+/// 10. **Response header stripping** — Configured internal headers (e.g.
+///     `Server`, `X-Powered-By`) are removed from the response.
+/// 11. **Response masking** — For text-based upstream responses, sensitive
+///     parameter values are masked before returning to the client.
 pub async fn handle_request(
     req: Request<Body>,
     client: HttpClient,
     config: Arc<RuntimeConfig>,
+    client_addr: SocketAddr,
 ) -> Result<Response<Body>> {
+    if headers::is_smuggling_attempt(req.headers()) {
+        return Err(ProxyError::RequestSmuggling);
+    }
+
+    if headers::content_length_exceeds(req.headers(), config.max_body_size) {
+        return Err(ProxyError::BodyTooLarge {
+            limit: config.max_body_size,
+        });
+    }
+
     let method = req.method().clone();
     let original_uri = req.uri().clone();
-
     if method == Method::GET {
         inspect_get_request(&req, &config)?;
     }
 
     let upstream_uri = rewrite_uri(&original_uri, &config.upstream)?;
-    let proxy_req = build_upstream_request(&req, upstream_uri, &config)?;
+    let (mut parts, body) = req.into_parts();
 
-    let (req_parts, body) = req.into_parts();
-    let _ = req_parts;
+    headers::strip_hop_by_hop(&mut parts.headers);
+    headers::inject_forwarding_headers(&mut parts.headers, client_addr);
+    headers::rewrite_host(
+        &mut parts.headers,
+        config
+            .upstream
+            .authority()
+            .ok_or_else(|| ProxyError::InvalidUpstream("upstream has no authority".into()))?,
+    );
 
-    let mut final_req = Request::from_parts(proxy_req.into_parts().0, body);
-    *final_req.method_mut() = method;
+    config.blocked_headers.iter().for_each(|blocked| {
+        if let Ok(name) = HeaderName::from_bytes(blocked.as_bytes()) {
+            parts.headers.remove(&name);
+        }
+    });
 
-    let upstream_resp = client.request(final_req).await?;
+    parts.uri = upstream_uri;
+    parts.method = method;
+
+    let proxy_req = Request::from_parts(parts, body);
+    let mut upstream_resp = client.request(proxy_req).await?;
+
+    headers::strip_hop_by_hop(upstream_resp.headers_mut());
+    if !config.strip_response_headers.is_empty() {
+        headers::strip_response_headers(
+            upstream_resp.headers_mut(),
+            &config.strip_response_headers,
+        );
+    }
+
     build_response(upstream_resp, &config).await
 }
 
@@ -102,39 +149,6 @@ fn rewrite_uri(original: &Uri, upstream: &Uri) -> Result<Uri> {
         .map_err(|e| ProxyError::Internal(format!("failed to build upstream URI: {e}")))
 }
 
-/// Constructs the upstream request with headers forwarded and blocked
-/// headers stripped.
-fn build_upstream_request(
-    original: &Request<Body>,
-    upstream_uri: Uri,
-    config: &RuntimeConfig,
-) -> Result<Request<Body>> {
-    let mut builder = Request::builder()
-        .method(original.method())
-        .uri(upstream_uri);
-
-    let outgoing_headers = builder
-        .headers_mut()
-        .ok_or_else(|| ProxyError::Internal("failed to access request headers".into()))?;
-
-    original
-        .headers()
-        .iter()
-        .filter(|(name, _)| {
-            !config
-                .blocked_headers
-                .iter()
-                .any(|blocked| blocked == name.as_str())
-        })
-        .for_each(|(name, value)| {
-            outgoing_headers.insert(name.clone(), value.clone());
-        });
-
-    builder
-        .body(Body::empty())
-        .map_err(|e| ProxyError::Internal(format!("failed to build upstream request: {e}")))
-}
-
 /// Builds the client-facing response from the upstream response.
 ///
 /// For responses whose `Content-Type` indicates text or form-encoded data,
@@ -161,7 +175,7 @@ async fn build_response(
     let (parts, body) = upstream_resp.into_parts();
     let body_bytes = hyper::body::to_bytes(body)
         .await
-        .map_err(|e| ProxyError::Upstream(format!("failed to read upstream body: {e}")))?;
+        .map_err(|e| ProxyError::Internal(format!("failed to read upstream body: {e}")))?;
 
     let body_str = String::from_utf8_lossy(&body_bytes);
     let masked = config.mask_sensitive_data(&body_str);
@@ -263,29 +277,5 @@ mod tests {
             .unwrap();
 
         assert!(inspect_get_request(&req, &config).is_ok());
-    }
-
-    #[test]
-    fn build_upstream_request_strips_blocked_headers() {
-        let config = Config {
-            upstream: "http://localhost:3000".into(),
-            blocked_headers: vec!["x-strip-me".into()],
-            ..Default::default()
-        }
-        .into_runtime()
-        .unwrap();
-
-        let original = Request::builder()
-            .uri("http://example.com/")
-            .header("x-strip-me", "gone")
-            .header("x-keep-me", "stay")
-            .body(Body::empty())
-            .unwrap();
-
-        let upstream_uri = parse_uri("http://localhost:3000/");
-        let result = build_upstream_request(&original, upstream_uri, &config).unwrap();
-
-        assert!(!result.headers().contains_key("x-strip-me"));
-        assert!(result.headers().contains_key("x-keep-me"));
     }
 }

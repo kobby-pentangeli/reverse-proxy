@@ -1,50 +1,94 @@
 //! Error types and HTTP status code mapping.
-
-use std::fmt;
+//!
+//! Provides the [ProxyError] type that captures every failure mode the proxy
+//! can encounter, and converts each variant into the appropriate HTTP
+//! response with a structured JSON body.
 
 use hyper::{Body, Response, StatusCode};
 
 /// Every failure the proxy can produce, each mapping to a specific HTTP status.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ProxyError {
     /// The configuration file could not be loaded or parsed.
+    #[error("configuration error: {0}")]
     Config(String),
+
     /// The upstream target URI is malformed or unparseable.
+    #[error("invalid upstream: {0}")]
     InvalidUpstream(String),
+
     /// A blocked header was detected in the incoming request.
+    #[error("blocked header: {0}")]
     BlockedHeader(String),
+
     /// A blocked query parameter was detected in the incoming request.
+    #[error("blocked parameter: {0}")]
     BlockedParam(String),
+
+    /// The request body exceeds the configured maximum size.
+    #[error("request body exceeds {limit} byte limit")]
+    BodyTooLarge {
+        /// The configured ceiling in bytes.
+        limit: u64,
+    },
+
+    /// The request contains both `Content-Length` and `Transfer-Encoding`,
+    /// indicating a potential HTTP request smuggling attack (RFC 7230 §3.3.3).
+    #[error("ambiguous request framing: both Content-Length and Transfer-Encoding present")]
+    RequestSmuggling,
+
     /// The upstream server returned an error or was unreachable.
-    Upstream(String),
+    #[error("upstream error: {0}")]
+    Upstream(#[from] hyper::Error),
+
+    /// An HTTP protocol-level error (e.g. invalid header construction).
+    #[error("http error: {0}")]
+    Http(#[from] hyper::http::Error),
+
+    /// An invalid header value was encountered during header construction.
+    #[error("invalid header value: {0}")]
+    InvalidHeaderValue(#[from] hyper::header::InvalidHeaderValue),
+
+    /// An invalid header name was encountered during header construction.
+    #[error("invalid header name: {0}")]
+    InvalidHeaderName(#[from] hyper::header::InvalidHeaderName),
+
     /// An internal error that does not fit other categories.
+    #[error("internal error: {0}")]
     Internal(String),
 }
-
-impl fmt::Display for ProxyError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Config(msg) => write!(f, "configuration error: {msg}"),
-            Self::InvalidUpstream(msg) => write!(f, "invalid upstream: {msg}"),
-            Self::BlockedHeader(name) => write!(f, "blocked header: {name}"),
-            Self::BlockedParam(name) => write!(f, "blocked parameter: {name}"),
-            Self::Upstream(msg) => write!(f, "upstream error: {msg}"),
-            Self::Internal(msg) => write!(f, "internal error: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for ProxyError {}
 
 impl ProxyError {
     /// Returns the HTTP status code corresponding to this error variant.
     pub fn status_code(&self) -> StatusCode {
         match self {
-            Self::Config(_) | Self::Internal(_) | Self::InvalidUpstream(_) => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            Self::Config(_)
+            | Self::Internal(_)
+            | Self::InvalidUpstream(_)
+            | Self::Http(_)
+            | Self::InvalidHeaderValue(_)
+            | Self::InvalidHeaderName(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::BlockedHeader(_) | Self::BlockedParam(_) => StatusCode::FORBIDDEN,
+            Self::BodyTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::RequestSmuggling => StatusCode::BAD_REQUEST,
             Self::Upstream(_) => StatusCode::BAD_GATEWAY,
+        }
+    }
+
+    /// Returns the machine-readable error tag for JSON responses.
+    fn error_tag(&self) -> &'static str {
+        match self {
+            Self::Config(_) => "config_error",
+            Self::InvalidUpstream(_) => "invalid_upstream",
+            Self::BlockedHeader(_) => "blocked_header",
+            Self::BlockedParam(_) => "blocked_param",
+            Self::BodyTooLarge { .. } => "body_too_large",
+            Self::RequestSmuggling => "request_smuggling",
+            Self::Upstream(_) => "upstream_error",
+            Self::Http(_) | Self::InvalidHeaderValue(_) | Self::InvalidHeaderName(_) => {
+                "http_error"
+            }
+            Self::Internal(_) => "internal_error",
         }
     }
 
@@ -52,14 +96,7 @@ impl ProxyError {
     pub fn into_response(self) -> Response<Body> {
         let status = self.status_code();
         let body = serde_json::json!({
-            "error": match &self {
-                Self::Config(_) => "config_error",
-                Self::InvalidUpstream(_) => "invalid_upstream",
-                Self::BlockedHeader(_) => "blocked_header",
-                Self::BlockedParam(_) => "blocked_param",
-                Self::Upstream(_) => "upstream_error",
-                Self::Internal(_) => "internal_error",
-            },
+            "error": self.error_tag(),
             "message": self.to_string(),
         });
 
@@ -73,29 +110,5 @@ impl ProxyError {
                     .body(Body::empty())
                     .expect("building fallback response must not fail")
             })
-    }
-}
-
-impl From<hyper::Error> for ProxyError {
-    fn from(err: hyper::Error) -> Self {
-        Self::Upstream(err.to_string())
-    }
-}
-
-impl From<hyper::http::Error> for ProxyError {
-    fn from(err: hyper::http::Error) -> Self {
-        Self::Internal(err.to_string())
-    }
-}
-
-impl From<hyper::header::InvalidHeaderValue> for ProxyError {
-    fn from(err: hyper::header::InvalidHeaderValue) -> Self {
-        Self::Internal(err.to_string())
-    }
-}
-
-impl From<hyper::header::InvalidHeaderName> for ProxyError {
-    fn from(err: hyper::header::InvalidHeaderName) -> Self {
-        Self::Internal(err.to_string())
     }
 }
