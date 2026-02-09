@@ -16,6 +16,14 @@ use tokio::sync::oneshot;
 /// A synthetic client address used in all test invocations.
 const TEST_CLIENT_ADDR: &str = "192.168.1.100:54321";
 
+/// Initializes a tracing subscriber for test output.
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_env_filter("debug")
+        .try_init();
+}
+
 fn test_addr() -> SocketAddr {
     TEST_CLIENT_ADDR.parse().unwrap()
 }
@@ -183,6 +191,7 @@ fn test_client() -> HttpClient {
 
 #[tokio::test]
 async fn get_request_forwards_to_upstream() {
+    init_tracing();
     let (addr, _shutdown) = start_backend(StatusCode::OK, "text/plain", "hello").await;
     let config = test_config(addr);
 
@@ -202,6 +211,7 @@ async fn get_request_forwards_to_upstream() {
 
 #[tokio::test]
 async fn post_request_forwards_without_inspection() {
+    init_tracing();
     let (addr, _shutdown) =
         start_backend(StatusCode::CREATED, "application/json", r#"{"id":1}"#).await;
     let config = test_config(addr);
@@ -221,6 +231,7 @@ async fn post_request_forwards_without_inspection() {
 
 #[tokio::test]
 async fn put_request_forwards_without_inspection() {
+    init_tracing();
     let (addr, _shutdown) = start_backend(StatusCode::OK, "text/plain", "updated").await;
     let config = test_config(addr);
 
@@ -238,6 +249,7 @@ async fn put_request_forwards_without_inspection() {
 
 #[tokio::test]
 async fn delete_request_forwards_without_inspection() {
+    init_tracing();
     let (addr, _shutdown) = start_backend(StatusCode::NO_CONTENT, "text/plain", "").await;
     let config = test_config(addr);
 
@@ -255,6 +267,7 @@ async fn delete_request_forwards_without_inspection() {
 
 #[tokio::test]
 async fn get_blocked_header_returns_403() {
+    init_tracing();
     let (addr, _shutdown) = start_backend(StatusCode::OK, "text/plain", "should not reach").await;
     let config = test_config(addr);
 
@@ -274,6 +287,7 @@ async fn get_blocked_header_returns_403() {
 
 #[tokio::test]
 async fn get_blocked_param_returns_403() {
+    init_tracing();
     let (addr, _shutdown) = start_backend(StatusCode::OK, "text/plain", "should not reach").await;
     let config = test_config(addr);
 
@@ -292,6 +306,7 @@ async fn get_blocked_param_returns_403() {
 
 #[tokio::test]
 async fn response_body_masking_replaces_sensitive_params() {
+    init_tracing();
     let (addr, _shutdown) = start_backend(
         StatusCode::OK,
         "application/x-www-form-urlencoded",
@@ -319,6 +334,7 @@ async fn response_body_masking_replaces_sensitive_params() {
 
 #[tokio::test]
 async fn response_body_not_masked_for_json_content_type() {
+    init_tracing();
     let (addr, _shutdown) = start_backend(
         StatusCode::OK,
         "application/json",
@@ -342,6 +358,7 @@ async fn response_body_not_masked_for_json_content_type() {
 
 #[tokio::test]
 async fn no_masking_when_mask_rules_empty() {
+    init_tracing();
     let (addr, _shutdown) = start_backend(StatusCode::OK, "text/plain", "password=visible").await;
 
     let config = Arc::new(
@@ -369,6 +386,7 @@ async fn no_masking_when_mask_rules_empty() {
 
 #[tokio::test]
 async fn upstream_preserves_status_code() {
+    init_tracing();
     let (addr, _shutdown) = start_backend(StatusCode::NOT_FOUND, "text/plain", "not found").await;
     let config = test_config(addr);
 
@@ -386,6 +404,7 @@ async fn upstream_preserves_status_code() {
 
 #[tokio::test]
 async fn smuggling_attempt_returns_400() {
+    init_tracing();
     let (addr, _shutdown) = start_backend(StatusCode::OK, "text/plain", "unreachable").await;
     let config = test_config(addr);
 
@@ -406,6 +425,7 @@ async fn smuggling_attempt_returns_400() {
 
 #[tokio::test]
 async fn body_too_large_returns_413() {
+    init_tracing();
     let (addr, _shutdown) = start_backend(StatusCode::OK, "text/plain", "unreachable").await;
     let config = test_config_with_body_limit(addr, 100);
 
@@ -425,6 +445,7 @@ async fn body_too_large_returns_413() {
 
 #[tokio::test]
 async fn body_within_limit_succeeds() {
+    init_tracing();
     let (addr, _shutdown) = start_backend(StatusCode::OK, "text/plain", "ok").await;
     let config = test_config_with_body_limit(addr, 1000);
 
@@ -443,6 +464,7 @@ async fn body_within_limit_succeeds() {
 
 #[tokio::test]
 async fn forwarding_headers_injected_to_upstream() {
+    init_tracing();
     let (addr, _shutdown) = start_echo_headers_backend().await;
     let config = test_config(addr);
 
@@ -475,6 +497,7 @@ async fn forwarding_headers_injected_to_upstream() {
 
 #[tokio::test]
 async fn host_header_rewritten_to_upstream() {
+    init_tracing();
     let (addr, _shutdown) = start_echo_headers_backend().await;
     let config = test_config(addr);
 
@@ -499,6 +522,7 @@ async fn host_header_rewritten_to_upstream() {
 
 #[tokio::test]
 async fn hop_by_hop_headers_stripped_from_request() {
+    init_tracing();
     let (addr, _shutdown) = start_echo_headers_backend().await;
     let config = test_config(addr);
 
@@ -538,6 +562,7 @@ async fn hop_by_hop_headers_stripped_from_request() {
 
 #[tokio::test]
 async fn response_strips_internal_and_hop_by_hop_headers() {
+    init_tracing();
     let (addr, _shutdown) = start_leaky_backend().await;
     let config = test_config_with_stripping(addr);
 

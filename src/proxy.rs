@@ -4,18 +4,27 @@
 //! (hop-by-hop header stripping, forwarding headers, request smuggling
 //! defense) and policy enforcement (header/param blocking, body size
 //! limits, response masking).
+//!
+//! Every inbound request is assigned a monotonically increasing request ID
+//! and wrapped in a [`tracing::Span`] carrying structured fields for
+//! observability.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use hyper::header::HeaderName;
 use hyper::{Body, Client, Method, Request, Response, Uri};
+use tracing::{Instrument, debug, info, warn};
 
 use crate::{ProxyError, Result, RuntimeConfig, headers};
 
 /// The HTTP client type used for upstream connections.
 pub type HttpClient = Client<hyper::client::HttpConnector>;
+
+/// Global monotonic counter for assigning unique request IDs.
+static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Processes a single inbound request through the proxy pipeline.
 ///
@@ -49,56 +58,108 @@ pub async fn handle_request(
     config: Arc<RuntimeConfig>,
     client_addr: SocketAddr,
 ) -> Result<Response<Body>> {
-    if headers::is_smuggling_attempt(req.headers()) {
-        return Err(ProxyError::RequestSmuggling);
-    }
-
-    if headers::content_length_exceeds(req.headers(), config.max_body_size) {
-        return Err(ProxyError::BodyTooLarge {
-            limit: config.max_body_size,
-        });
-    }
-
+    let request_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     let method = req.method().clone();
-    let original_uri = req.uri().clone();
-    if method == Method::GET {
-        inspect_get_request(&req, &config)?;
-    }
+    let uri = req.uri().clone();
 
-    let upstream_uri = rewrite_uri(&original_uri, &config.upstream)?;
-    let (mut parts, body) = req.into_parts();
-
-    headers::strip_hop_by_hop(&mut parts.headers);
-    headers::inject_forwarding_headers(&mut parts.headers, client_addr);
-    headers::rewrite_host(
-        &mut parts.headers,
-        config
-            .upstream
-            .authority()
-            .ok_or_else(|| ProxyError::InvalidUpstream("upstream has no authority".into()))?,
+    let span = tracing::info_span!(
+        "request",
+        id = request_id,
+        method = %method,
+        uri = %uri,
+        client = %client_addr,
     );
 
-    config.blocked_headers.iter().for_each(|blocked| {
-        if let Ok(name) = HeaderName::from_bytes(blocked.as_bytes()) {
-            parts.headers.remove(&name);
+    async move {
+        info!(upstream = %config.upstream, "received request");
+
+        if headers::is_smuggling_attempt(req.headers()) {
+            warn!("request smuggling attempt detected");
+            return Err(ProxyError::RequestSmuggling);
         }
-    });
 
-    parts.uri = upstream_uri;
-    parts.method = method;
+        if headers::content_length_exceeds(req.headers(), config.max_body_size) {
+            let declared = req
+                .headers()
+                .get(hyper::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("unknown");
+            warn!(
+                content_length = declared,
+                limit = config.max_body_size,
+                "request body exceeds size limit"
+            );
+            return Err(ProxyError::BodyTooLarge {
+                limit: config.max_body_size,
+            });
+        }
 
-    let proxy_req = Request::from_parts(parts, body);
-    let mut upstream_resp = client.request(proxy_req).await?;
+        if method == Method::GET {
+            inspect_get_request(&req, &config)?;
+        }
 
-    headers::strip_hop_by_hop(upstream_resp.headers_mut());
-    if !config.strip_response_headers.is_empty() {
-        headers::strip_response_headers(
-            upstream_resp.headers_mut(),
-            &config.strip_response_headers,
+        let upstream_uri = rewrite_uri(&uri, &config.upstream)?;
+        let (mut parts, body) = req.into_parts();
+
+        headers::strip_hop_by_hop(&mut parts.headers);
+        headers::inject_forwarding_headers(&mut parts.headers, client_addr);
+        headers::rewrite_host(
+            &mut parts.headers,
+            config
+                .upstream
+                .authority()
+                .ok_or_else(|| ProxyError::InvalidUpstream("upstream has no authority".into()))?,
         );
-    }
 
-    build_response(upstream_resp, &config).await
+        config.blocked_headers.iter().for_each(|blocked| {
+            if let Ok(name) = HeaderName::from_bytes(blocked.as_bytes()) {
+                parts.headers.remove(&name);
+            }
+        });
+
+        parts.uri = upstream_uri;
+        parts.method = method;
+
+        debug!(
+            headers = ?parts.headers,
+            upstream_uri = %parts.uri,
+            "forwarding request"
+        );
+
+        let start = std::time::Instant::now();
+        let proxy_req = Request::from_parts(parts, body);
+        let upstream_result = client.request(proxy_req).await;
+
+        let mut upstream_resp = match upstream_result {
+            Ok(resp) => resp,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    latency_ms = start.elapsed().as_millis() as u64,
+                    "upstream request failed"
+                );
+                return Err(ProxyError::Upstream(e));
+            }
+        };
+
+        let latency_ms = start.elapsed().as_millis() as u64;
+        info!(
+            status = upstream_resp.status().as_u16(),
+            latency_ms, "upstream responded"
+        );
+
+        headers::strip_hop_by_hop(upstream_resp.headers_mut());
+        if !config.strip_response_headers.is_empty() {
+            headers::strip_response_headers(
+                upstream_resp.headers_mut(),
+                &config.strip_response_headers,
+            );
+        }
+
+        build_response(upstream_resp, &config).await
+    }
+    .instrument(span)
+    .await
 }
 
 /// Checks a GET request against configured block rules.
@@ -115,14 +176,20 @@ fn inspect_get_request(req: &Request<Body>, config: &RuntimeConfig) -> Result<()
                 .ok()
                 .is_some_and(|name| headers.contains_key(&name))
         })
-        .map_or(Ok(()), |name| Err(ProxyError::BlockedHeader(name.clone())))?;
+        .map_or(Ok(()), |name| {
+            warn!(header = %name, "blocked header detected");
+            Err(ProxyError::BlockedHeader(name.clone()))
+        })?;
 
     let query = req.uri().query().unwrap_or_default();
     config
         .blocked_params
         .iter()
         .find(|param| query.contains(&format!("{param}=")))
-        .map_or(Ok(()), |name| Err(ProxyError::BlockedParam(name.clone())))
+        .map_or(Ok(()), |name| {
+            warn!(param = %name, "blocked parameter detected");
+            Err(ProxyError::BlockedParam(name.clone()))
+        })
 }
 
 /// Rewrites the original request URI to target the configured upstream,

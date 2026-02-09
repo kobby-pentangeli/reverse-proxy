@@ -4,17 +4,35 @@ use std::sync::Arc;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Client, Response, Server};
 use reverse_proxy::{Config, handle_request};
+use tracing::{error, info};
+use tracing_subscriber::EnvFilter;
 
 const CONFIG_FILE_PATH: &str = "./Config.yml";
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .init();
+
     let config = Config::load_from_file(CONFIG_FILE_PATH)
         .and_then(|c| c.into_runtime())
         .unwrap_or_else(|e| {
-            eprintln!("fatal: {e}");
+            error!(%e, "failed to load configuration");
             std::process::exit(1);
         });
+
+    info!(
+        upstream = %config.upstream,
+        blocked_headers = config.blocked_headers.len(),
+        blocked_params = config.blocked_params.len(),
+        mask_rules = config.mask_rules.len(),
+        max_body_size = config.max_body_size,
+        "configuration loaded"
+    );
 
     let config = Arc::new(config);
     let addr = SocketAddr::from(([127, 0, 0, 1], 8100));
@@ -47,9 +65,9 @@ async fn main() {
         .http1_title_case_headers(true)
         .serve(make_service);
 
-    println!("listening on http://{addr}");
+    info!(%addr, "listening");
 
     if let Err(e) = server.await {
-        eprintln!("server error: {e}");
+        error!(%e, "server terminated with error");
     }
 }

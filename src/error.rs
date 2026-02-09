@@ -5,6 +5,7 @@
 //! response with a structured JSON body.
 
 use hyper::{Body, Response, StatusCode};
+use tracing::warn;
 
 /// Every failure the proxy can produce, each mapping to a specific HTTP status.
 #[derive(Debug, thiserror::Error)]
@@ -75,26 +76,18 @@ impl ProxyError {
         }
     }
 
-    /// Returns the machine-readable error tag for JSON responses.
-    fn error_tag(&self) -> &'static str {
-        match self {
-            Self::Config(_) => "config_error",
-            Self::InvalidUpstream(_) => "invalid_upstream",
-            Self::BlockedHeader(_) => "blocked_header",
-            Self::BlockedParam(_) => "blocked_param",
-            Self::BodyTooLarge { .. } => "body_too_large",
-            Self::RequestSmuggling => "request_smuggling",
-            Self::Upstream(_) => "upstream_error",
-            Self::Http(_) | Self::InvalidHeaderValue(_) | Self::InvalidHeaderName(_) => {
-                "http_error"
-            }
-            Self::Internal(_) => "internal_error",
-        }
-    }
-
     /// Converts this error into an HTTP response with a JSON body.
+    ///
+    /// Emits a WARN-level log line with the status code and error tag
+    /// before constructing the response.
     pub fn into_response(self) -> Response<Body> {
         let status = self.status_code();
+        warn!(
+            status = status.as_u16(),
+            error = self.error_tag(),
+            %self,
+            "returning error response"
+        );
         let body = serde_json::json!({
             "error": self.error_tag(),
             "message": self.to_string(),
@@ -110,5 +103,22 @@ impl ProxyError {
                     .body(Body::empty())
                     .expect("building fallback response must not fail")
             })
+    }
+
+    /// Returns the machine-readable error tag for JSON responses.
+    fn error_tag(&self) -> &'static str {
+        match self {
+            Self::Config(_) => "config_error",
+            Self::InvalidUpstream(_) => "invalid_upstream",
+            Self::BlockedHeader(_) => "blocked_header",
+            Self::BlockedParam(_) => "blocked_param",
+            Self::BodyTooLarge { .. } => "body_too_large",
+            Self::RequestSmuggling => "request_smuggling",
+            Self::Upstream(_) => "upstream_error",
+            Self::Http(_) | Self::InvalidHeaderValue(_) | Self::InvalidHeaderName(_) => {
+                "http_error"
+            }
+            Self::Internal(_) => "internal_error",
+        }
     }
 }
