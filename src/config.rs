@@ -5,10 +5,12 @@
 //! and stored alongside the raw config for zero-allocation lookups at
 //! request time.
 
-use crate::ProxyError;
+use std::path::Path;
+
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+
+use crate::{ProxyError, Result};
 
 /// Raw configuration as deserialized from the YAML file.
 ///
@@ -61,7 +63,7 @@ impl Config {
     ///
     /// Returns a [`ProxyError::Config`] if the file cannot be opened or
     /// its contents fail YAML deserialization.
-    pub fn load_from_file(file_path: &(impl AsRef<Path> + ?Sized)) -> Result<Self, ProxyError> {
+    pub fn load_from_file(file_path: &(impl AsRef<Path> + ?Sized)) -> Result<Self> {
         let file = std::fs::File::open(file_path).map_err(|e| {
             ProxyError::Config(format!(
                 "failed to open {}: {e}",
@@ -78,7 +80,7 @@ impl Config {
     ///
     /// Fails if the upstream URI is empty or malformed, or if any
     /// masked-parameter regex fails to compile.
-    pub fn into_runtime(self) -> Result<RuntimeConfig, ProxyError> {
+    pub fn into_runtime(self) -> Result<RuntimeConfig> {
         if self.upstream.is_empty() {
             return Err(ProxyError::InvalidUpstream(
                 "upstream must not be empty".into(),
@@ -113,7 +115,7 @@ impl Config {
                         ProxyError::Config(format!("invalid mask pattern for {param}: {e}"))
                     })
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(RuntimeConfig {
             upstream,

@@ -1,7 +1,8 @@
 //! Error types and HTTP status code mapping.
 
-use hyper::{Body, Response, StatusCode};
 use std::fmt;
+
+use hyper::{Body, Response, StatusCode};
 
 /// Every failure the proxy can produce, each mapping to a specific HTTP status.
 #[derive(Debug)]
