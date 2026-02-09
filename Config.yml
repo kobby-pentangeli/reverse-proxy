@@ -1,3 +1,4 @@
+upstream: "http://localhost:3000"
 blocked_headers:
   - User-Agent
   - X-Forwarded-For
