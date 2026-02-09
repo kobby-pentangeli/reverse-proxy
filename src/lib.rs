@@ -10,6 +10,7 @@
 
 pub mod config;
 pub mod error;
+pub mod headers;
 pub mod proxy;
 
 pub use config::{Config, RuntimeConfig};
