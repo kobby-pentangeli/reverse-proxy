@@ -76,6 +76,23 @@ pub struct Config {
     /// Service Unavailable (default: 1000).
     #[serde(default)]
     pub max_concurrent_requests: Option<usize>,
+    /// TLS termination configuration for accepting HTTPS connections from
+    /// clients. When absent, the proxy listens on plain HTTP.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+}
+
+/// TLS termination configuration.
+///
+/// When present in the config file, the proxy accepts HTTPS connections
+/// using the certificate chain and private key at the specified paths.
+/// Both files must be PEM-encoded.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TlsConfig {
+    /// Path to the PEM-encoded certificate chain file.
+    pub cert_path: String,
+    /// Path to the PEM-encoded private key file.
+    pub key_path: String,
 }
 
 /// Fully validated, ready-to-use configuration with pre-compiled patterns.
@@ -109,6 +126,8 @@ pub struct RuntimeConfig {
     pub pool_max_idle_per_host: usize,
     /// Maximum concurrent in-flight requests. Overflow yields 503.
     pub max_concurrent_requests: usize,
+    /// TLS termination configuration. `None` means plain HTTP.
+    pub tls: Option<TlsConfig>,
 }
 
 /// A single pre-compiled masking rule binding a parameter name to its regex.
@@ -219,6 +238,7 @@ impl Config {
             pool_idle_timeout,
             pool_max_idle_per_host,
             max_concurrent_requests,
+            tls: self.tls,
         })
     }
 }

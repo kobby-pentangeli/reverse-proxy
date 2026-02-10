@@ -19,9 +19,12 @@ pub mod config;
 pub mod error;
 pub mod headers;
 pub mod proxy;
+pub mod tls;
 
 pub use config::{Config, RuntimeConfig};
 pub use error::ProxyError;
-pub use proxy::{BoxBody, HttpClient, build_client, handle_request};
+pub use proxy::{
+    BoxBody, HttpClient, HttpsClient, build_client, build_https_client, handle_request,
+};
 
 pub type Result<T> = std::result::Result<T, ProxyError>;

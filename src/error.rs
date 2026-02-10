@@ -67,6 +67,10 @@ pub enum ProxyError {
         limit: usize,
     },
 
+    /// A TLS configuration or handshake error.
+    #[error("tls error: {0}")]
+    Tls(String),
+
     /// An internal error that does not fit other categories.
     #[error("internal error: {0}")]
     Internal(String),
@@ -81,7 +85,8 @@ impl ProxyError {
             | Self::InvalidUpstream(_)
             | Self::Http(_)
             | Self::InvalidHeaderValue(_)
-            | Self::InvalidHeaderName(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            | Self::InvalidHeaderName(_)
+            | Self::Tls(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::BlockedHeader(_) | Self::BlockedParam(_) => StatusCode::FORBIDDEN,
             Self::BodyTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Self::RequestSmuggling => StatusCode::BAD_REQUEST,
@@ -135,6 +140,7 @@ impl ProxyError {
             Self::Http(_) | Self::InvalidHeaderValue(_) | Self::InvalidHeaderName(_) => {
                 "http_error"
             }
+            Self::Tls(_) => "tls_error",
             Self::Internal(_) => "internal_error",
         }
     }
