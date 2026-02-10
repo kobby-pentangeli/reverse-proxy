@@ -24,7 +24,10 @@ use hyper_util::rt::TokioExecutor;
 use tokio::time::timeout;
 use tracing::{Instrument, debug, info, warn};
 
-use crate::{ProxyError, Result, RuntimeConfig, headers};
+use crate::{ProxyError, Result, RuntimeConfig, headers, tls};
+
+/// An alias to simplify the calls to `Box<dyn std::error::Error + Send + Sync>`.
+type StdError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Type-erased body used for both request forwarding and response streaming.
 ///
@@ -38,24 +41,32 @@ use crate::{ProxyError, Result, RuntimeConfig, headers};
 /// can be erased into the same type without lossy conversions.
 pub type BoxBody = http_body_util::combinators::BoxBody<Bytes, StdError>;
 
-/// The HTTP client type used for upstream connections, built on the
-/// hyper-util legacy client with a standard TCP connector and a
-/// type-erased request body.
+/// The HTTP client type for plain TCP upstream connections.
 pub type HttpClient = Client<HttpConnector, BoxBody>;
 
-/// An alias to simplify the calls to `Box<dyn std::error::Error + Send + Sync>`.
-type StdError = Box<dyn std::error::Error + Send + Sync>;
+/// The HTTPS client type for TLS-secured upstream connections.
+pub type HttpsClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, BoxBody>;
 
 /// Global monotonic counter for assigning unique request IDs.
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Constructs a new [`HttpClient`] with the given connection pool and
-/// protocol settings from the runtime configuration.
+/// Constructs a new [`HttpClient`] for plain HTTP upstream connections.
 pub fn build_client(config: &RuntimeConfig) -> HttpClient {
     Client::builder(TokioExecutor::new())
         .pool_idle_timeout(config.pool_idle_timeout)
         .pool_max_idle_per_host(config.pool_max_idle_per_host)
         .build(HttpConnector::new())
+}
+
+/// Constructs a new [`HttpsClient`] capable of both HTTP and HTTPS
+/// upstream connections, using the platform root certificate store for
+/// server verification.
+pub fn build_https_client(config: &RuntimeConfig) -> HttpsClient {
+    let connector = tls::build_https_connector();
+    Client::builder(TokioExecutor::new())
+        .pool_idle_timeout(config.pool_idle_timeout)
+        .pool_max_idle_per_host(config.pool_max_idle_per_host)
+        .build(connector)
 }
 
 /// Processes a single inbound request through the proxy pipeline.
@@ -84,15 +95,16 @@ pub fn build_client(config: &RuntimeConfig) -> HttpClient {
 ///     `Server`, `X-Powered-By`) are removed from the response.
 /// 11. **Response masking** — For text-based upstream responses, sensitive
 ///     parameter values are masked before returning to the client.
-pub async fn handle_request<B>(
+pub async fn handle_request<B, C>(
     req: Request<B>,
-    client: HttpClient,
+    client: Client<C, BoxBody>,
     config: Arc<RuntimeConfig>,
     client_addr: SocketAddr,
 ) -> Result<Response<BoxBody>>
 where
     B: hyper::body::Body<Data = Bytes> + Send + Sync + 'static,
     B::Error: Into<StdError>,
+    C: hyper_util::client::legacy::connect::Connect + Clone + Send + Sync + 'static,
 {
     let request_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     let method = req.method().clone();

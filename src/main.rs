@@ -7,7 +7,9 @@ use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
-use reverse_proxy::{BoxBody, Config, ProxyError, build_client, handle_request};
+use reverse_proxy::{
+    BoxBody, Config, ProxyError, RuntimeConfig, build_client, build_https_client, handle_request,
+};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
@@ -31,6 +33,18 @@ async fn main() {
             std::process::exit(1);
         });
 
+    let tls_acceptor = config.tls.as_ref().map(|tls_cfg| {
+        reverse_proxy::tls::build_tls_acceptor(tls_cfg).unwrap_or_else(|e| {
+            error!(%e, "failed to initialize TLS");
+            std::process::exit(1);
+        })
+    });
+
+    let upstream_is_https = config
+        .upstream
+        .scheme_str()
+        .is_some_and(|s| s.eq_ignore_ascii_case("https"));
+
     info!(
         upstream = %config.upstream,
         blocked_headers = config.blocked_headers.len(),
@@ -40,14 +54,14 @@ async fn main() {
         connect_timeout = ?config.connect_timeout,
         request_timeout = ?config.request_timeout,
         max_concurrent_requests = config.max_concurrent_requests,
+        tls_termination = tls_acceptor.is_some(),
+        tls_origination = upstream_is_https,
         "configuration loaded"
     );
 
     let semaphore = Arc::new(Semaphore::new(config.max_concurrent_requests));
     let concurrency_limit = config.max_concurrent_requests;
-
     let config = Arc::new(config);
-    let client = build_client(&config);
     let addr = SocketAddr::from(([127, 0, 0, 1], 8100));
 
     let listener = TcpListener::bind(addr).await.unwrap_or_else(|e| {
@@ -57,6 +71,47 @@ async fn main() {
 
     info!(%addr, "listening");
 
+    if upstream_is_https {
+        let client = build_https_client(&config);
+        serve(
+            listener,
+            tls_acceptor,
+            client,
+            config,
+            semaphore,
+            concurrency_limit,
+        )
+        .await;
+    } else {
+        let client = build_client(&config);
+        serve(
+            listener,
+            tls_acceptor,
+            client,
+            config,
+            semaphore,
+            concurrency_limit,
+        )
+        .await;
+    }
+
+    info!("shutdown complete");
+}
+
+/// Accepts connections on `listener`, optionally wrapping each in TLS via
+/// `tls_acceptor`, and dispatches them through the proxy pipeline using the
+/// given `client`. Generic over the client connector type so that both
+/// plain-HTTP and HTTPS upstreams use the same accept loop.
+async fn serve<C>(
+    listener: TcpListener,
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    client: hyper_util::client::legacy::Client<C, BoxBody>,
+    config: Arc<RuntimeConfig>,
+    semaphore: Arc<Semaphore>,
+    concurrency_limit: usize,
+) where
+    C: hyper_util::client::legacy::connect::Connect + Clone + Send + Sync + 'static,
+{
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
 
@@ -74,9 +129,10 @@ async fn main() {
                 let client = client.clone();
                 let config = Arc::clone(&config);
                 let semaphore = Arc::clone(&semaphore);
+                let tls_acceptor = tls_acceptor.clone();
 
                 tokio::spawn(async move {
-                    let service = service_fn(move |req: hyper::Request<Incoming>| {
+                    let svc = service_fn(move |req: hyper::Request<Incoming>| {
                         let client = client.clone();
                         let config = Arc::clone(&config);
                         let semaphore = Arc::clone(&semaphore);
@@ -124,12 +180,29 @@ async fn main() {
                         }
                     });
 
-                    if let Err(e) = http1::Builder::new()
-                        .preserve_header_case(true)
-                        .title_case_headers(true)
-                        .serve_connection(TokioIo::new(stream), service)
-                        .await
-                    {
+                    let builder = http1::Builder::new();
+
+                    let result = match tls_acceptor {
+                        Some(acceptor) => {
+                            let tls_stream = match acceptor.accept(stream).await {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    warn!(%e, "TLS handshake failed");
+                                    return;
+                                }
+                            };
+                            builder
+                                .serve_connection(TokioIo::new(tls_stream), svc)
+                                .await
+                        }
+                        None => {
+                            builder
+                                .serve_connection(TokioIo::new(stream), svc)
+                                .await
+                        }
+                    };
+
+                    if let Err(e) = result {
                         warn!(%e, "connection error");
                     }
                 });
@@ -140,8 +213,6 @@ async fn main() {
             }
         }
     }
-
-    info!("shutdown complete");
 }
 
 /// Awaits a shutdown signal (SIGINT or SIGTERM on Unix, Ctrl+C on all
