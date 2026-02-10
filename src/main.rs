@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use http_body_util::BodyExt;
 use hyper::Response;
@@ -8,7 +9,8 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use reverse_proxy::{
-    BoxBody, Config, ProxyError, RuntimeConfig, build_client, build_https_client, handle_request,
+    BoxBody, Config, LoadBalancer, ProxyError, RuntimeConfig, UpstreamPool, build_client,
+    build_https_client, handle_request,
 };
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
@@ -40,13 +42,12 @@ async fn main() {
         })
     });
 
-    let upstream_is_https = config
-        .upstream
-        .scheme_str()
-        .is_some_and(|s| s.eq_ignore_ascii_case("https"));
+    let upstream_is_https = config.has_https_upstream();
+    let pool = UpstreamPool::from_validated(&config.upstreams);
+    let balancer = LoadBalancer::new(pool);
 
     info!(
-        upstream = %config.upstream,
+        upstreams = config.upstreams.len(),
         blocked_headers = config.blocked_headers.len(),
         blocked_params = config.blocked_params.len(),
         mask_rules = config.mask_rules.len(),
@@ -56,8 +57,18 @@ async fn main() {
         max_concurrent_requests = config.max_concurrent_requests,
         tls_termination = tls_acceptor.is_some(),
         tls_origination = upstream_is_https,
+        active_health_checks = config.health_check.is_some(),
         "configuration loaded"
     );
+
+    for (i, u) in config.upstreams.iter().enumerate() {
+        info!(
+            index = i,
+            upstream = %u.uri,
+            weight = u.weight,
+            "registered upstream backend"
+        );
+    }
 
     let semaphore = Arc::new(Semaphore::new(config.max_concurrent_requests));
     let concurrency_limit = config.max_concurrent_requests;
@@ -71,6 +82,15 @@ async fn main() {
 
     info!(%addr, "listening");
 
+    let health_check_handle = config.health_check.as_ref().map(|hc| {
+        spawn_health_checker(
+            balancer.clone(),
+            Duration::from_millis(hc.interval_ms),
+            &hc.path,
+            config.failure_threshold,
+        )
+    });
+
     if upstream_is_https {
         let client = build_https_client(&config);
         serve(
@@ -78,6 +98,7 @@ async fn main() {
             tls_acceptor,
             client,
             config,
+            balancer,
             semaphore,
             concurrency_limit,
         )
@@ -89,10 +110,15 @@ async fn main() {
             tls_acceptor,
             client,
             config,
+            balancer,
             semaphore,
             concurrency_limit,
         )
         .await;
+    }
+
+    if let Some(handle) = health_check_handle {
+        handle.abort();
     }
 
     info!("shutdown complete");
@@ -100,13 +126,14 @@ async fn main() {
 
 /// Accepts connections on `listener`, optionally wrapping each in TLS via
 /// `tls_acceptor`, and dispatches them through the proxy pipeline using the
-/// given `client`. Generic over the client connector type so that both
-/// plain-HTTP and HTTPS upstreams use the same accept loop.
+/// given `client` and `balancer`. Generic over the client connector type so
+/// that both plain-HTTP and HTTPS upstreams use the same accept loop.
 async fn serve<C>(
     listener: TcpListener,
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
     client: hyper_util::client::legacy::Client<C, BoxBody>,
     config: Arc<RuntimeConfig>,
+    balancer: LoadBalancer,
     semaphore: Arc<Semaphore>,
     concurrency_limit: usize,
 ) where
@@ -130,12 +157,14 @@ async fn serve<C>(
                 let config = Arc::clone(&config);
                 let semaphore = Arc::clone(&semaphore);
                 let tls_acceptor = tls_acceptor.clone();
+                let balancer = balancer.clone();
 
                 tokio::spawn(async move {
                     let svc = service_fn(move |req: hyper::Request<Incoming>| {
                         let client = client.clone();
                         let config = Arc::clone(&config);
                         let semaphore = Arc::clone(&semaphore);
+                        let balancer = balancer.clone();
                         async move {
                             let _permit = match semaphore.try_acquire() {
                                 Ok(permit) => permit,
@@ -162,7 +191,7 @@ async fn serve<C>(
                                 }
                             };
 
-                            let resp = handle_request(req, client, config, client_addr)
+                            let resp = handle_request(req, client, config, balancer, client_addr)
                                 .await
                                 .unwrap_or_else(|e| {
                                     e.into_response().map(|b| {
@@ -213,6 +242,97 @@ async fn serve<C>(
             }
         }
     }
+}
+
+/// Spawns a background task that periodically probes each upstream backend
+/// at the configured health check path, updating health state based on
+/// HTTP response status.
+fn spawn_health_checker(
+    balancer: LoadBalancer,
+    interval: Duration,
+    path: &str,
+    failure_threshold: u32,
+) -> tokio::task::JoinHandle<()> {
+    let path = path.to_owned();
+    let connector = hyper_util::client::legacy::connect::HttpConnector::new();
+    let client: hyper_util::client::legacy::Client<_, http_body_util::Empty<bytes::Bytes>> =
+        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+            .build(connector);
+
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            ticker.tick().await;
+
+            for backend in balancer.pool().all() {
+                let uri_str = format!(
+                    "{}://{}{}",
+                    backend.uri().scheme_str().unwrap_or("http"),
+                    backend
+                        .uri()
+                        .authority()
+                        .map(|a| a.as_str())
+                        .unwrap_or("localhost"),
+                    path,
+                );
+
+                let uri = match uri_str.parse::<hyper::Uri>() {
+                    Ok(u) => u,
+                    Err(e) => {
+                        warn!(
+                            upstream = %backend.uri(),
+                            error = %e,
+                            "failed to build health check URI"
+                        );
+                        continue;
+                    }
+                };
+
+                let result = tokio::time::timeout(Duration::from_secs(5), client.get(uri)).await;
+
+                match result {
+                    Ok(Ok(resp)) if resp.status().is_success() => {
+                        let was_unhealthy = !backend.is_healthy();
+                        backend.record_success();
+                        if was_unhealthy {
+                            info!(
+                                upstream = %backend.uri(),
+                                "health check passed, backend recovered"
+                            );
+                        }
+                    }
+                    Ok(Ok(resp)) => {
+                        let transitioned = backend.record_failure(failure_threshold);
+                        warn!(
+                            upstream = %backend.uri(),
+                            status = resp.status().as_u16(),
+                            marked_unhealthy = transitioned,
+                            "health check returned non-success status"
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        let transitioned = backend.record_failure(failure_threshold);
+                        warn!(
+                            upstream = %backend.uri(),
+                            error = %e,
+                            marked_unhealthy = transitioned,
+                            "health check request failed"
+                        );
+                    }
+                    Err(_) => {
+                        let transitioned = backend.record_failure(failure_threshold);
+                        warn!(
+                            upstream = %backend.uri(),
+                            marked_unhealthy = transitioned,
+                            "health check timed out"
+                        );
+                    }
+                }
+            }
+        }
+    })
 }
 
 /// Awaits a shutdown signal (SIGINT or SIGTERM on Unix, Ctrl+C on all

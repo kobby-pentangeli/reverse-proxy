@@ -3,7 +3,7 @@
 //! Implements the full proxy pipeline including HTTP spec compliance
 //! (hop-by-hop header stripping, forwarding headers, request smuggling
 //! defense) and policy enforcement (header/param blocking, body size
-//! limits, response masking).
+//! limits, response masking, load balancing).
 //!
 //! Every inbound request is assigned a monotonically increasing request ID
 //! and wrapped in a [`tracing::Span`] carrying structured fields for
@@ -24,6 +24,7 @@ use hyper_util::rt::TokioExecutor;
 use tokio::time::timeout;
 use tracing::{Instrument, debug, info, warn};
 
+use crate::balancer::LoadBalancer;
 use crate::{ProxyError, Result, RuntimeConfig, headers, tls};
 
 /// An alias to simplify the calls to `Box<dyn std::error::Error + Send + Sync>`.
@@ -80,25 +81,31 @@ pub fn build_https_client(config: &RuntimeConfig) -> HttpsClient {
 /// 3. **GET inspection** — If the request method is GET, blocked headers and
 ///    query parameters are checked. Requests matching any block rule receive
 ///    a 403 Forbidden response.
-/// 4. **Hop-by-hop stripping** — Connection-scoped headers are removed
+/// 4. **Upstream selection** — The round-robin balancer selects the next
+///    healthy backend. If none are available, returns 503.
+/// 5. **Hop-by-hop stripping** — Connection-scoped headers are removed
 ///    before forwarding, per RFC 7230 §6.1.
-/// 5. **Forwarding headers** — `X-Forwarded-For`, `X-Forwarded-Proto`, and
+/// 6. **Forwarding headers** — `X-Forwarded-For`, `X-Forwarded-Proto`, and
 ///    `X-Forwarded-Host` are injected to preserve client origin metadata.
-/// 6. **Host rewriting** — The `Host` header is set to the upstream authority.
-/// 7. **URI rewriting** — The request URI is rewritten to target the configured
+/// 7. **Host rewriting** — The `Host` header is set to the upstream authority.
+/// 8. **URI rewriting** — The request URI is rewritten to target the selected
 ///    upstream, preserving the original path and query string.
-/// 8. **Body streaming** — The request body is passed through to the upstream
+/// 9. **Body streaming** — The request body is passed through to the upstream
 ///    without buffering.
-/// 9. **Response hop-by-hop stripping** — Connection-scoped headers are
-///    removed from the upstream response.
-/// 10. **Response header stripping** — Configured internal headers (e.g.
+/// 10. **Passive health tracking** — On upstream success, the backend's
+///     failure counter is reset. On failure/timeout, it is incremented and
+///     the backend may be marked unhealthy.
+/// 11. **Response hop-by-hop stripping** — Connection-scoped headers are
+///     removed from the upstream response.
+/// 12. **Response header stripping** — Configured internal headers (e.g.
 ///     `Server`, `X-Powered-By`) are removed from the response.
-/// 11. **Response masking** — For text-based upstream responses, sensitive
+/// 13. **Response masking** — For text-based upstream responses, sensitive
 ///     parameter values are masked before returning to the client.
 pub async fn handle_request<B, C>(
     req: Request<B>,
     client: Client<C, BoxBody>,
     config: Arc<RuntimeConfig>,
+    balancer: LoadBalancer,
     client_addr: SocketAddr,
 ) -> Result<Response<BoxBody>>
 where
@@ -119,8 +126,6 @@ where
     );
 
     async move {
-        info!(upstream = %config.upstream, "received request");
-
         if headers::is_smuggling_attempt(req.headers()) {
             warn!("request smuggling attempt detected");
             return Err(ProxyError::RequestSmuggling);
@@ -146,15 +151,18 @@ where
             inspect_get_request(&req, &config)?;
         }
 
-        let upstream_uri = rewrite_uri(&uri, &config.upstream)?;
+        let upstream = balancer.next()?;
+        let upstream_uri_target = upstream.uri();
+        info!(upstream = %upstream_uri_target, "received request");
+
+        let rewritten_uri = rewrite_uri(&uri, upstream_uri_target)?;
         let (mut parts, body) = req.into_parts();
 
         headers::strip_hop_by_hop(&mut parts.headers);
         headers::inject_forwarding_headers(&mut parts.headers, client_addr);
         headers::rewrite_host(
             &mut parts.headers,
-            config
-                .upstream
+            upstream_uri_target
                 .authority()
                 .ok_or_else(|| ProxyError::InvalidUpstream("upstream has no authority".into()))?,
         );
@@ -165,8 +173,7 @@ where
             }
         });
 
-        parts.uri = upstream_uri;
-        parts.method = method;
+        parts.uri = rewritten_uri;
 
         debug!(
             headers = ?parts.headers,
@@ -181,19 +188,28 @@ where
         let upstream_result = timeout(config.request_timeout, client.request(proxy_req)).await;
 
         let mut upstream_resp = match upstream_result {
-            Ok(Ok(resp)) => resp,
+            Ok(Ok(resp)) => {
+                upstream.record_success();
+                resp
+            }
             Ok(Err(e)) => {
+                let transitioned = upstream.record_failure(config.failure_threshold);
                 warn!(
                     error = %e,
                     latency_ms = start.elapsed().as_millis() as u64,
+                    upstream = %upstream_uri_target,
+                    marked_unhealthy = transitioned,
                     "upstream request failed"
                 );
                 return Err(ProxyError::Upstream(e));
             }
             Err(_elapsed) => {
+                let transitioned = upstream.record_failure(config.failure_threshold);
                 warn!(
                     timeout = ?config.request_timeout,
                     latency_ms = start.elapsed().as_millis() as u64,
+                    upstream = %upstream_uri_target,
+                    marked_unhealthy = transitioned,
                     "upstream request timed out"
                 );
                 return Err(ProxyError::Timeout(config.request_timeout));
@@ -203,7 +219,9 @@ where
         let latency_ms = start.elapsed().as_millis() as u64;
         info!(
             status = upstream_resp.status().as_u16(),
-            latency_ms, "upstream responded"
+            latency_ms,
+            upstream = %upstream_uri_target,
+            "upstream responded"
         );
 
         headers::strip_hop_by_hop(upstream_resp.headers_mut());
@@ -333,9 +351,17 @@ mod tests {
 
     use super::*;
     use crate::Config;
+    use crate::config::UpstreamConfig;
 
     fn parse_uri(uri: &str) -> Uri {
         uri.parse::<Uri>().expect("failed to parse URI")
+    }
+
+    fn single_upstream(addr: &str) -> Vec<UpstreamConfig> {
+        vec![UpstreamConfig {
+            address: addr.into(),
+            weight: 1,
+        }]
     }
 
     #[test]
@@ -361,7 +387,7 @@ mod tests {
     #[test]
     fn inspect_get_detects_blocked_header() {
         let config = Config {
-            upstream: "http://localhost:3000".into(),
+            upstreams: single_upstream("http://localhost:3000"),
             blocked_headers: vec!["x-bad-header".into()],
             ..Default::default()
         }
@@ -382,7 +408,7 @@ mod tests {
     #[test]
     fn inspect_get_detects_blocked_param() {
         let config = Config {
-            upstream: "http://localhost:3000".into(),
+            upstreams: single_upstream("http://localhost:3000"),
             blocked_params: vec!["secret_key".into()],
             ..Default::default()
         }
@@ -402,7 +428,7 @@ mod tests {
     #[test]
     fn inspect_get_allows_clean_request() {
         let config = Config {
-            upstream: "http://localhost:3000".into(),
+            upstreams: single_upstream("http://localhost:3000"),
             blocked_headers: vec!["x-bad-header".into()],
             blocked_params: vec!["secret_key".into()],
             ..Default::default()

@@ -32,6 +32,21 @@ pub const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 32;
 /// will handle before returning 503 Service Unavailable.
 pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 1000;
 
+/// Default weight assigned to upstream backends when none is specified.
+pub const DEFAULT_UPSTREAM_WEIGHT: u32 = 1;
+
+/// Default number of consecutive failures before marking a backend unhealthy.
+pub const DEFAULT_FAILURE_THRESHOLD: u32 = 3;
+
+/// Default cooldown period before re-checking an unhealthy backend.
+pub const DEFAULT_HEALTH_CHECK_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Default interval between active health check probes.
+pub const DEFAULT_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Default path for active health check probes.
+pub const DEFAULT_HEALTH_CHECK_PATH: &str = "/health";
+
 /// Raw configuration as deserialized from the YAML file.
 ///
 /// This struct maps directly to the on-disk schema. After loading, it is
@@ -39,8 +54,9 @@ pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 1000;
 /// patterns and validated upstream URIs.
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Config {
-    /// The upstream backend to forward requests to (e.g. `"http://localhost:3000"`).
-    pub upstream: String,
+    /// Upstream backends with optional weights and health check config.
+    #[serde(default)]
+    pub upstreams: Vec<UpstreamConfig>,
     /// Header names whose presence causes the request to be rejected.
     #[serde(default)]
     pub blocked_headers: Vec<String>,
@@ -80,6 +96,74 @@ pub struct Config {
     /// clients. When absent, the proxy listens on plain HTTP.
     #[serde(default)]
     pub tls: Option<TlsConfig>,
+    /// Health check configuration for upstream backends.
+    #[serde(default)]
+    pub health_check: Option<HealthCheckConfig>,
+}
+
+/// Configuration for a single upstream backend.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UpstreamConfig {
+    /// The backend address (e.g. `"http://backend1:3000"`).
+    pub address: String,
+    /// Relative weight for load balancing. Higher values receive
+    /// proportionally more traffic. Defaults to 1.
+    #[serde(default = "default_weight")]
+    pub weight: u32,
+}
+
+fn default_weight() -> u32 {
+    DEFAULT_UPSTREAM_WEIGHT
+}
+
+/// Active health check configuration.
+///
+/// When present, the proxy spawns a background task that periodically
+/// probes each upstream at the configured path, marking backends as
+/// healthy or unhealthy based on response status.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HealthCheckConfig {
+    /// HTTP path to probe (default: `/health`).
+    #[serde(default = "default_health_path")]
+    pub path: String,
+    /// Interval between health check probes in milliseconds (default: 10000).
+    #[serde(default = "default_health_interval_ms")]
+    pub interval_ms: u64,
+    /// Number of consecutive failures before marking a backend unhealthy
+    /// (default: 3).
+    #[serde(default = "default_failure_threshold")]
+    pub failure_threshold: u32,
+    /// Cooldown period in milliseconds before re-checking an unhealthy
+    /// backend (default: 30000).
+    #[serde(default = "default_cooldown_ms")]
+    pub cooldown_ms: u64,
+}
+
+fn default_health_path() -> String {
+    DEFAULT_HEALTH_CHECK_PATH.into()
+}
+
+fn default_health_interval_ms() -> u64 {
+    DEFAULT_HEALTH_CHECK_INTERVAL.as_millis() as u64
+}
+
+fn default_failure_threshold() -> u32 {
+    DEFAULT_FAILURE_THRESHOLD
+}
+
+fn default_cooldown_ms() -> u64 {
+    DEFAULT_HEALTH_CHECK_COOLDOWN.as_millis() as u64
+}
+
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            path: default_health_path(),
+            interval_ms: default_health_interval_ms(),
+            failure_threshold: default_failure_threshold(),
+            cooldown_ms: default_cooldown_ms(),
+        }
+    }
 }
 
 /// TLS termination configuration.
@@ -95,6 +179,15 @@ pub struct TlsConfig {
     pub key_path: String,
 }
 
+/// Validated upstream backend descriptor produced from [`UpstreamConfig`].
+#[derive(Debug, Clone)]
+pub struct ValidatedUpstream {
+    /// The parsed and validated upstream URI.
+    pub uri: hyper::Uri,
+    /// Relative weight for load balancing.
+    pub weight: u32,
+}
+
 /// Fully validated, ready-to-use configuration with pre-compiled patterns.
 ///
 /// Created once at startup and shared across all request handlers via `Arc`.
@@ -102,8 +195,8 @@ pub struct TlsConfig {
 /// filesystem or compiling regexes on the hot path.
 #[derive(Debug)]
 pub struct RuntimeConfig {
-    /// The validated upstream base URI (scheme + authority).
-    pub upstream: hyper::Uri,
+    /// Validated upstream backends with their load-balancing weights.
+    pub upstreams: Vec<ValidatedUpstream>,
     /// Lowercased header names whose presence triggers a 403 on GET requests.
     pub blocked_headers: Vec<String>,
     /// Query parameter names whose presence triggers a 403 on GET requests.
@@ -128,6 +221,12 @@ pub struct RuntimeConfig {
     pub max_concurrent_requests: usize,
     /// TLS termination configuration. `None` means plain HTTP.
     pub tls: Option<TlsConfig>,
+    /// Active health check configuration. `None` disables active probing.
+    pub health_check: Option<HealthCheckConfig>,
+    /// Number of consecutive failures before marking a backend unhealthy.
+    pub failure_threshold: u32,
+    /// Cooldown period before re-checking an unhealthy backend.
+    pub health_check_cooldown: Duration,
 }
 
 /// A single pre-compiled masking rule binding a parameter name to its regex.
@@ -137,6 +236,31 @@ pub struct MaskRule {
     pub param: String,
     /// Compiled regex matching `{param}={value}` in query-string-style text.
     pub pattern: Regex,
+}
+
+/// Validates a single upstream address string, returning a [`ValidatedUpstream`].
+fn validate_upstream(address: &str, weight: u32) -> Result<ValidatedUpstream> {
+    if address.is_empty() {
+        return Err(ProxyError::InvalidUpstream(
+            "upstream address must not be empty".into(),
+        ));
+    }
+
+    let uri = address
+        .parse::<hyper::Uri>()
+        .map_err(|e| ProxyError::InvalidUpstream(format!("{e}")))?;
+
+    uri.authority().ok_or_else(|| {
+        ProxyError::InvalidUpstream(format!("upstream URI has no authority: {address}"))
+    })?;
+
+    if weight == 0 {
+        return Err(ProxyError::Config(format!(
+            "upstream weight must be positive: {address}"
+        )));
+    }
+
+    Ok(ValidatedUpstream { uri, weight })
 }
 
 impl Config {
@@ -159,22 +283,19 @@ impl Config {
     /// Validates all fields and compiles regex patterns, producing a
     /// [`RuntimeConfig`] suitable for the proxy hot path.
     ///
-    /// Fails if the upstream URI is empty or malformed, or if any
-    /// masked-parameter regex fails to compile.
+    /// At least one upstream must be configured.
     pub fn into_runtime(self) -> Result<RuntimeConfig> {
-        if self.upstream.is_empty() {
-            return Err(ProxyError::InvalidUpstream(
-                "upstream must not be empty".into(),
+        if self.upstreams.is_empty() {
+            return Err(ProxyError::Config(
+                "at least one upstream must be configured".into(),
             ));
         }
 
-        let upstream = self
-            .upstream
-            .parse::<hyper::Uri>()
-            .map_err(|e| ProxyError::InvalidUpstream(format!("{e}")))?;
-        upstream
-            .authority()
-            .ok_or_else(|| ProxyError::InvalidUpstream("upstream URI has no authority".into()))?;
+        let upstreams = self
+            .upstreams
+            .iter()
+            .map(|u| validate_upstream(&u.address, u.weight))
+            .collect::<Result<Vec<_>>>()?;
 
         let blocked_headers = self
             .blocked_headers
@@ -226,8 +347,20 @@ impl Config {
             .max_concurrent_requests
             .unwrap_or(DEFAULT_MAX_CONCURRENT_REQUESTS);
 
+        let failure_threshold = self
+            .health_check
+            .as_ref()
+            .map_or(DEFAULT_FAILURE_THRESHOLD, |hc| hc.failure_threshold);
+
+        let health_check_cooldown = self
+            .health_check
+            .as_ref()
+            .map_or(DEFAULT_HEALTH_CHECK_COOLDOWN, |hc| {
+                Duration::from_millis(hc.cooldown_ms)
+            });
+
         Ok(RuntimeConfig {
-            upstream,
+            upstreams,
             blocked_headers,
             blocked_params: self.blocked_params,
             mask_rules,
@@ -239,11 +372,23 @@ impl Config {
             pool_max_idle_per_host,
             max_concurrent_requests,
             tls: self.tls,
+            health_check: self.health_check,
+            failure_threshold,
+            health_check_cooldown,
         })
     }
 }
 
 impl RuntimeConfig {
+    /// Returns `true` if any configured upstream uses the HTTPS scheme.
+    pub fn has_https_upstream(&self) -> bool {
+        self.upstreams.iter().any(|u| {
+            u.uri
+                .scheme_str()
+                .is_some_and(|s| s.eq_ignore_ascii_case("https"))
+        })
+    }
+
     /// Applies all configured masking rules to the given text, replacing
     /// matched parameter values with `****`.
     ///
@@ -262,11 +407,19 @@ impl RuntimeConfig {
 mod tests {
     use super::*;
 
+    fn single_upstream(addr: &str) -> Vec<UpstreamConfig> {
+        vec![UpstreamConfig {
+            address: addr.into(),
+            weight: 1,
+        }]
+    }
+
     #[test]
     fn loads_config_from_file() {
         let config = Config::load_from_file("./Config.yml").expect("Config.yml should be loadable");
 
-        assert_eq!(config.upstream, "http://localhost:3000");
+        assert_eq!(config.upstreams.len(), 1);
+        assert_eq!(config.upstreams[0].address, "http://localhost:3000");
         assert_eq!(
             config.blocked_headers,
             vec!["User-Agent", "X-Forwarded-For"]
@@ -281,18 +434,18 @@ mod tests {
     }
 
     #[test]
-    fn into_runtime_validates_upstream() {
-        let config = Config {
-            upstream: String::new(),
-            ..Default::default()
-        };
+    fn into_runtime_rejects_empty_upstreams() {
+        let config = Config::default();
         assert!(config.into_runtime().is_err());
     }
 
     #[test]
     fn into_runtime_rejects_malformed_upstream() {
         let config = Config {
-            upstream: "not a valid uri %%".into(),
+            upstreams: vec![UpstreamConfig {
+                address: "not a valid uri %%".into(),
+                weight: 1,
+            }],
             ..Default::default()
         };
         assert!(config.into_runtime().is_err());
@@ -301,7 +454,7 @@ mod tests {
     #[test]
     fn into_runtime_lowercases_blocked_headers() {
         let config = Config {
-            upstream: "http://localhost:3000".into(),
+            upstreams: single_upstream("http://localhost:3000"),
             blocked_headers: vec!["X-Custom-Header".into()],
             ..Default::default()
         };
@@ -310,9 +463,80 @@ mod tests {
     }
 
     #[test]
+    fn into_runtime_validates_upstreams() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            ..Default::default()
+        };
+        let rt = config.into_runtime().expect("valid config");
+        assert_eq!(rt.upstreams.len(), 1);
+        assert_eq!(
+            rt.upstreams[0].uri,
+            "http://localhost:3000".parse::<hyper::Uri>().unwrap()
+        );
+        assert_eq!(rt.upstreams[0].weight, 1);
+    }
+
+    #[test]
+    fn into_runtime_handles_multiple_upstreams() {
+        let config = Config {
+            upstreams: vec![
+                UpstreamConfig {
+                    address: "http://backend1:3000".into(),
+                    weight: 3,
+                },
+                UpstreamConfig {
+                    address: "http://backend2:3000".into(),
+                    weight: 1,
+                },
+            ],
+            ..Default::default()
+        };
+        let rt = config.into_runtime().expect("valid config");
+        assert_eq!(rt.upstreams.len(), 2);
+        assert_eq!(
+            rt.upstreams[0].uri,
+            "http://backend1:3000".parse::<hyper::Uri>().unwrap()
+        );
+        assert_eq!(rt.upstreams[0].weight, 3);
+        assert_eq!(rt.upstreams[1].weight, 1);
+    }
+
+    #[test]
+    fn into_runtime_rejects_zero_weight() {
+        let config = Config {
+            upstreams: vec![UpstreamConfig {
+                address: "http://localhost:3000".into(),
+                weight: 0,
+            }],
+            ..Default::default()
+        };
+        assert!(config.into_runtime().is_err());
+    }
+
+    #[test]
+    fn has_https_upstream_detects_scheme() {
+        let config = Config {
+            upstreams: vec![
+                UpstreamConfig {
+                    address: "http://backend1:3000".into(),
+                    weight: 1,
+                },
+                UpstreamConfig {
+                    address: "https://backend2:3000".into(),
+                    weight: 1,
+                },
+            ],
+            ..Default::default()
+        };
+        let rt = config.into_runtime().unwrap();
+        assert!(rt.has_https_upstream());
+    }
+
+    #[test]
     fn mask_sensitive_data_replaces_values() {
         let config = Config {
-            upstream: "http://localhost:3000".into(),
+            upstreams: single_upstream("http://localhost:3000"),
             masked_params: vec!["password".into(), "token".into()],
             ..Default::default()
         };
@@ -326,7 +550,7 @@ mod tests {
     #[test]
     fn mask_sensitive_data_leaves_unmatched_text_intact() {
         let config = Config {
-            upstream: "http://localhost:3000".into(),
+            upstreams: single_upstream("http://localhost:3000"),
             masked_params: vec!["password".into()],
             ..Default::default()
         };
@@ -339,7 +563,7 @@ mod tests {
     #[test]
     fn mask_handles_regex_special_characters_in_param_name() {
         let config = Config {
-            upstream: "http://localhost:3000".into(),
+            upstreams: single_upstream("http://localhost:3000"),
             masked_params: vec!["user.password".into()],
             ..Default::default()
         };
@@ -350,5 +574,18 @@ mod tests {
             rt.mask_sensitive_data(input),
             "user.password=****&other=value"
         );
+    }
+
+    #[test]
+    fn health_check_config_uses_defaults() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            health_check: Some(HealthCheckConfig::default()),
+            ..Default::default()
+        };
+        let rt = config.into_runtime().unwrap();
+        assert_eq!(rt.failure_threshold, DEFAULT_FAILURE_THRESHOLD);
+        assert_eq!(rt.health_check_cooldown, DEFAULT_HEALTH_CHECK_COOLDOWN);
+        assert!(rt.health_check.is_some());
     }
 }

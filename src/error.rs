@@ -71,6 +71,10 @@ pub enum ProxyError {
     #[error("tls error: {0}")]
     Tls(String),
 
+    /// No healthy upstream backend is available to serve the request.
+    #[error("no healthy upstream backend available")]
+    NoHealthyUpstream,
+
     /// An internal error that does not fit other categories.
     #[error("internal error: {0}")]
     Internal(String),
@@ -87,6 +91,7 @@ impl ProxyError {
             | Self::InvalidHeaderValue(_)
             | Self::InvalidHeaderName(_)
             | Self::Tls(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::NoHealthyUpstream => StatusCode::SERVICE_UNAVAILABLE,
             Self::BlockedHeader(_) | Self::BlockedParam(_) => StatusCode::FORBIDDEN,
             Self::BodyTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Self::RequestSmuggling => StatusCode::BAD_REQUEST,
@@ -141,6 +146,7 @@ impl ProxyError {
                 "http_error"
             }
             Self::Tls(_) => "tls_error",
+            Self::NoHealthyUpstream => "no_healthy_upstream",
             Self::Internal(_) => "internal_error",
         }
     }
