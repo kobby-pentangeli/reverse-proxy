@@ -16,8 +16,7 @@ use hyper_rustls::HttpsConnectorBuilder;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::TlsAcceptor;
 
-use crate::config::TlsConfig;
-use crate::{ProxyError, Result};
+use crate::{ProxyError, Result, TlsConfig};
 
 /// Builds a [`TlsAcceptor`] from the given TLS configuration.
 ///

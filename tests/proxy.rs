@@ -1,293 +1,19 @@
-//! Integration tests using a local hyper backend server.
+//! Integration tests for the core HTTP proxy pipeline.
 //!
-//! Each test spins up a throwaway HTTP server on an OS-assigned port,
-//! configures the proxy to point at it, and exercises the full
-//! `handle_request` pipeline without touching the network.
+//! Exercises request forwarding, method handling, header/parameter blocking,
+//! response masking, hop-by-hop stripping, body size limits, and timeouts
+//! against throwaway local backends.
 
-use std::net::SocketAddr;
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use reverse_proxy::{BoxBody, Config, HttpClient, RuntimeConfig, handle_request};
-use tokio::net::TcpListener;
-use tokio::sync::oneshot;
-
-/// A synthetic client address used in all test invocations.
-const TEST_CLIENT_ADDR: &str = "192.168.1.100:54321";
-
-/// Initializes a tracing subscriber for test output.
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_env_filter("debug")
-        .try_init();
-}
-
-fn test_addr() -> SocketAddr {
-    TEST_CLIENT_ADDR.parse().unwrap()
-}
-
-/// Starts a local HTTP server that responds to every request with the given
-/// status, content-type, and body. Returns the server address and a handle
-/// to shut it down.
-async fn start_backend(
-    status: StatusCode,
-    content_type: &'static str,
-    body: &'static str,
-) -> (SocketAddr, oneshot::Sender<()>) {
-    let (tx, rx) = oneshot::channel::<()>();
-
-    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .await
-        .expect("failed to bind test backend");
-    let addr = listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        let mut shutdown = std::pin::pin!(async {
-            let _ = rx.await;
-        });
-
-        loop {
-            tokio::select! {
-                result = listener.accept() => {
-                    let (stream, _) = result.expect("accept failed");
-                    let service = service_fn(move |_req: Request<Incoming>| {
-                        async move {
-                            Ok::<_, std::convert::Infallible>(
-                                Response::builder()
-                                    .status(status)
-                                    .header("content-type", content_type)
-                                    .body(Full::new(Bytes::from(body)))
-                                    .expect("test response must build"),
-                            )
-                        }
-                    });
-                    tokio::spawn(async move {
-                        let _ = http1::Builder::new()
-                            .serve_connection(TokioIo::new(stream), service)
-                            .await;
-                    });
-                }
-                () = &mut shutdown => break,
-            }
-        }
-    });
-
-    (addr, tx)
-}
-
-/// Starts a local backend that captures and echoes request headers as the
-/// response body. Used to verify that the proxy correctly transforms headers.
-async fn start_echo_headers_backend() -> (SocketAddr, oneshot::Sender<()>) {
-    let (tx, rx) = oneshot::channel::<()>();
-
-    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .await
-        .expect("failed to bind test backend");
-    let addr = listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        let mut shutdown = std::pin::pin!(async {
-            let _ = rx.await;
-        });
-
-        loop {
-            tokio::select! {
-                result = listener.accept() => {
-                    let (stream, _) = result.expect("accept failed");
-                    let service = service_fn(|req: Request<Incoming>| async move {
-                        let mut lines = Vec::new();
-                        for (name, value) in req.headers() {
-                            if let Ok(v) = value.to_str() {
-                                lines.push(format!("{}: {}", name.as_str(), v));
-                            }
-                        }
-                        lines.sort();
-                        let body = lines.join("\n");
-                        Ok::<_, std::convert::Infallible>(
-                            Response::builder()
-                                .status(StatusCode::OK)
-                                .header("content-type", "text/plain")
-                                .body(Full::new(Bytes::from(body)))
-                                .expect("test response must build"),
-                        )
-                    });
-                    tokio::spawn(async move {
-                        let _ = http1::Builder::new()
-                            .serve_connection(TokioIo::new(stream), service)
-                            .await;
-                    });
-                }
-                () = &mut shutdown => break,
-            }
-        }
-    });
-
-    (addr, tx)
-}
-
-/// Starts a backend that returns responses with internal implementation headers.
-async fn start_leaky_backend() -> (SocketAddr, oneshot::Sender<()>) {
-    let (tx, rx) = oneshot::channel::<()>();
-
-    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .await
-        .expect("failed to bind test backend");
-    let addr = listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        let mut shutdown = std::pin::pin!(async {
-            let _ = rx.await;
-        });
-
-        loop {
-            tokio::select! {
-                result = listener.accept() => {
-                    let (stream, _) = result.expect("accept failed");
-                    let service = service_fn(|_req: Request<Incoming>| async {
-                        Ok::<_, std::convert::Infallible>(
-                            Response::builder()
-                                .status(StatusCode::OK)
-                                .header("content-type", "text/plain")
-                                .header("server", "Apache/2.4.52")
-                                .header("x-powered-by", "PHP/8.1")
-                                .header("connection", "keep-alive")
-                                .header("keep-alive", "timeout=5")
-                                .body(Full::new(Bytes::from("ok")))
-                                .expect("test response must build"),
-                        )
-                    });
-                    tokio::spawn(async move {
-                        let _ = http1::Builder::new()
-                            .serve_connection(TokioIo::new(stream), service)
-                            .await;
-                    });
-                }
-                () = &mut shutdown => break,
-            }
-        }
-    });
-
-    (addr, tx)
-}
-
-/// Starts a backend that sleeps for the given duration before responding.
-async fn start_slow_backend(delay: Duration) -> (SocketAddr, oneshot::Sender<()>) {
-    let (tx, rx) = oneshot::channel::<()>();
-
-    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .await
-        .expect("failed to bind test backend");
-    let addr = listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        let mut shutdown = std::pin::pin!(async {
-            let _ = rx.await;
-        });
-
-        loop {
-            tokio::select! {
-                result = listener.accept() => {
-                    let (stream, _) = result.expect("accept failed");
-                    let service = service_fn(move |_req: Request<Incoming>| async move {
-                        tokio::time::sleep(delay).await;
-                        Ok::<_, std::convert::Infallible>(
-                            Response::builder()
-                                .status(StatusCode::OK)
-                                .header("content-type", "text/plain")
-                                .body(Full::new(Bytes::from("slow")))
-                                .expect("test response must build"),
-                        )
-                    });
-                    tokio::spawn(async move {
-                        let _ = http1::Builder::new()
-                            .serve_connection(TokioIo::new(stream), service)
-                            .await;
-                    });
-                }
-                () = &mut shutdown => break,
-            }
-        }
-    });
-
-    (addr, tx)
-}
-
-/// Builds a `RuntimeConfig` targeting the given local backend address.
-fn test_config(addr: SocketAddr) -> Arc<RuntimeConfig> {
-    Arc::new(
-        Config {
-            upstream: format!("http://{addr}"),
-            blocked_headers: vec!["x-blocked".into()],
-            blocked_params: vec!["secret_key".into()],
-            masked_params: vec!["password".into(), "ssn".into()],
-            ..Default::default()
-        }
-        .into_runtime()
-        .expect("test config must be valid"),
-    )
-}
-
-/// Builds a `RuntimeConfig` with response header stripping enabled.
-fn test_config_with_stripping(addr: SocketAddr) -> Arc<RuntimeConfig> {
-    Arc::new(
-        Config {
-            upstream: format!("http://{addr}"),
-            strip_response_headers: vec!["server".into(), "x-powered-by".into()],
-            ..Default::default()
-        }
-        .into_runtime()
-        .expect("test config must be valid"),
-    )
-}
-
-/// Builds a `RuntimeConfig` with a specific body size limit.
-fn test_config_with_body_limit(addr: SocketAddr, limit: u64) -> Arc<RuntimeConfig> {
-    Arc::new(
-        Config {
-            upstream: format!("http://{addr}"),
-            max_body_size: Some(limit),
-            ..Default::default()
-        }
-        .into_runtime()
-        .expect("test config must be valid"),
-    )
-}
-
-/// Builds a `RuntimeConfig` with a short request timeout for testing.
-fn test_config_with_timeout(addr: SocketAddr, timeout_ms: u64) -> Arc<RuntimeConfig> {
-    Arc::new(
-        Config {
-            upstream: format!("http://{addr}"),
-            request_timeout_ms: Some(timeout_ms),
-            ..Default::default()
-        }
-        .into_runtime()
-        .expect("test config must be valid"),
-    )
-}
-
-fn test_client() -> HttpClient {
-    Client::builder(TokioExecutor::new())
-        .build(hyper_util::client::legacy::connect::HttpConnector::new())
-}
-
-/// Collects a [`BoxBody`] into [`Bytes`], mapping any body error to a
-/// descriptive panic so test assertions remain concise.
-async fn collect_body(body: BoxBody) -> Bytes {
-    body.collect()
-        .await
-        .expect("failed to collect response body")
-        .to_bytes()
-}
+use common::*;
+use http_body_util::Full;
+use hyper::{Method, Request, StatusCode};
+use reverse_proxy::{Config, handle_request};
 
 #[tokio::test]
 async fn get_request_forwards_to_upstream() {
@@ -363,6 +89,24 @@ async fn delete_request_forwards_without_inspection() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn upstream_preserves_status_code() {
+    init_tracing();
+    let (addr, _shutdown) = start_backend(StatusCode::NOT_FOUND, "text/plain", "not found").await;
+    let config = test_config(addr);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("http://{addr}/missing"))
+        .body(http_body_util::Empty::<Bytes>::new())
+        .unwrap();
+
+    let resp = handle_request(req, test_client(), config, test_addr())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -482,24 +226,6 @@ async fn no_masking_when_mask_rules_empty() {
         .unwrap();
     let body = collect_body(resp.into_body()).await;
     assert_eq!(body, Bytes::from("password=visible"));
-}
-
-#[tokio::test]
-async fn upstream_preserves_status_code() {
-    init_tracing();
-    let (addr, _shutdown) = start_backend(StatusCode::NOT_FOUND, "text/plain", "not found").await;
-    let config = test_config(addr);
-
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri(format!("http://{addr}/missing"))
-        .body(http_body_util::Empty::<Bytes>::new())
-        .unwrap();
-
-    let resp = handle_request(req, test_client(), config, test_addr())
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
