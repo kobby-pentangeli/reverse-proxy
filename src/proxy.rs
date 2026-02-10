@@ -14,18 +14,49 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
 use hyper::header::HeaderName;
-use hyper::{Body, Client, Method, Request, Response, Uri};
+use hyper::{Method, Request, Response, Uri};
+use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::rt::TokioExecutor;
 use tokio::time::timeout;
 use tracing::{Instrument, debug, info, warn};
 
 use crate::{ProxyError, Result, RuntimeConfig, headers};
 
-/// The HTTP client type used for upstream connections.
-pub type HttpClient = Client<hyper::client::HttpConnector>;
+/// Type-erased body used for both request forwarding and response streaming.
+///
+/// Wraps any body implementation behind a single boxed trait object,
+/// allowing the handler to accept requests with arbitrary body types
+/// (e.g. `Incoming`, `Full<Bytes>`, `Empty<Bytes>`) and return a uniform
+/// response type regardless of origin.
+///
+/// Uses a trait-object error type so that both `Incoming` (which yields
+/// `hyper::Error`) and locally constructed bodies (which are infallible)
+/// can be erased into the same type without lossy conversions.
+pub type BoxBody = http_body_util::combinators::BoxBody<Bytes, StdError>;
+
+/// The HTTP client type used for upstream connections, built on the
+/// hyper-util legacy client with a standard TCP connector and a
+/// type-erased request body.
+pub type HttpClient = Client<HttpConnector, BoxBody>;
+
+/// An alias to simplify the calls to `Box<dyn std::error::Error + Send + Sync>`.
+type StdError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Global monotonic counter for assigning unique request IDs.
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Constructs a new [`HttpClient`] with the given connection pool and
+/// protocol settings from the runtime configuration.
+pub fn build_client(config: &RuntimeConfig) -> HttpClient {
+    Client::builder(TokioExecutor::new())
+        .pool_idle_timeout(config.pool_idle_timeout)
+        .pool_max_idle_per_host(config.pool_max_idle_per_host)
+        .build(HttpConnector::new())
+}
 
 /// Processes a single inbound request through the proxy pipeline.
 ///
@@ -53,12 +84,16 @@ static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 ///     `Server`, `X-Powered-By`) are removed from the response.
 /// 11. **Response masking** — For text-based upstream responses, sensitive
 ///     parameter values are masked before returning to the client.
-pub async fn handle_request(
-    req: Request<Body>,
+pub async fn handle_request<B>(
+    req: Request<B>,
     client: HttpClient,
     config: Arc<RuntimeConfig>,
     client_addr: SocketAddr,
-) -> Result<Response<Body>> {
+) -> Result<Response<BoxBody>>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + Sync + 'static,
+    B::Error: Into<StdError>,
+{
     let request_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     let method = req.method().clone();
     let uri = req.uri().clone();
@@ -128,7 +163,8 @@ pub async fn handle_request(
         );
 
         let start = std::time::Instant::now();
-        let proxy_req = Request::from_parts(parts, body);
+        let boxed_body = body.map_err(|e| e.into()).boxed();
+        let proxy_req = Request::from_parts(parts, boxed_body);
 
         let upstream_result = timeout(config.request_timeout, client.request(proxy_req)).await;
 
@@ -176,7 +212,7 @@ pub async fn handle_request(
 ///
 /// Returns `ProxyError::BlockedHeader` or `ProxyError::BlockedParam`
 /// if any rule matches, allowing the caller to short-circuit with a 403.
-fn inspect_get_request(req: &Request<Body>, config: &RuntimeConfig) -> Result<()> {
+fn inspect_get_request<B>(req: &Request<B>, config: &RuntimeConfig) -> Result<()> {
     let headers = req.headers();
     config
         .blocked_headers
@@ -232,11 +268,15 @@ fn rewrite_uri(original: &Uri, upstream: &Uri) -> Result<Uri> {
 /// the body is collected and scanned for sensitive parameter values. All
 /// other responses are streamed through unmodified.
 async fn build_response(
-    upstream_resp: Response<Body>,
+    upstream_resp: Response<Incoming>,
     config: &RuntimeConfig,
-) -> Result<Response<Body>> {
+) -> Result<Response<BoxBody>> {
     if config.mask_rules.is_empty() {
-        return Ok(upstream_resp);
+        let (parts, body) = upstream_resp.into_parts();
+        return Ok(Response::from_parts(
+            parts,
+            body.map_err(|e| -> StdError { Box::new(e) }).boxed(),
+        ));
     }
 
     let should_mask = upstream_resp
@@ -246,18 +286,28 @@ async fn build_response(
         .is_some_and(|ct| ct.contains("text/") || ct.contains("application/x-www-form-urlencoded"));
 
     if !should_mask {
-        return Ok(upstream_resp);
+        let (parts, body) = upstream_resp.into_parts();
+        return Ok(Response::from_parts(
+            parts,
+            body.map_err(|e| -> StdError { Box::new(e) }).boxed(),
+        ));
     }
 
     let (parts, body) = upstream_resp.into_parts();
-    let body_bytes = hyper::body::to_bytes(body)
+    let body_bytes = body
+        .collect()
         .await
-        .map_err(|e| ProxyError::Internal(format!("failed to read upstream body: {e}")))?;
+        .map_err(|e| ProxyError::Internal(format!("failed to read upstream body: {e}")))?
+        .to_bytes();
 
     let body_str = String::from_utf8_lossy(&body_bytes);
     let masked = config.mask_sensitive_data(&body_str);
 
-    let mut response = Response::new(Body::from(Bytes::from(masked)));
+    let mut response = Response::new(
+        Full::new(Bytes::from(masked))
+            .map_err(|never| -> StdError { match never {} })
+            .boxed(),
+    );
     *response.status_mut() = parts.status;
     *response.headers_mut() = parts.headers;
     *response.version_mut() = parts.version;
@@ -267,6 +317,8 @@ async fn build_response(
 
 #[cfg(test)]
 mod tests {
+    use http_body_util::Empty;
+
     use super::*;
     use crate::Config;
 
@@ -308,7 +360,7 @@ mod tests {
             .method(Method::GET)
             .uri("http://example.com/")
             .header("x-bad-header", "anything")
-            .body(Body::empty())
+            .body(Empty::<Bytes>::new())
             .unwrap();
 
         let result = inspect_get_request(&req, &config);
@@ -328,7 +380,7 @@ mod tests {
         let req = Request::builder()
             .method(Method::GET)
             .uri("http://example.com/?secret_key=abc123")
-            .body(Body::empty())
+            .body(Empty::<Bytes>::new())
             .unwrap();
 
         let result = inspect_get_request(&req, &config);
@@ -350,7 +402,7 @@ mod tests {
             .method(Method::GET)
             .uri("http://example.com/path?safe=true")
             .header("x-good-header", "ok")
-            .body(Body::empty())
+            .body(Empty::<Bytes>::new())
             .unwrap();
 
         assert!(inspect_get_request(&req, &config).is_ok());

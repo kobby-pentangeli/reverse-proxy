@@ -4,7 +4,9 @@
 //! can encounter, and converts each variant into the appropriate HTTP
 //! response with a structured JSON body.
 
-use hyper::{Body, Response, StatusCode};
+use bytes::Bytes;
+use http_body_util::Full;
+use hyper::{Response, StatusCode};
 use tracing::warn;
 
 /// Every failure the proxy can produce, each mapping to a specific HTTP status.
@@ -40,7 +42,7 @@ pub enum ProxyError {
 
     /// The upstream server returned an error or was unreachable.
     #[error("upstream error: {0}")]
-    Upstream(#[from] hyper::Error),
+    Upstream(#[from] hyper_util::client::legacy::Error),
 
     /// An HTTP protocol-level error (e.g. invalid header construction).
     #[error("http error: {0}")]
@@ -93,7 +95,7 @@ impl ProxyError {
     ///
     /// Emits a WARN-level log line with the status code and error tag
     /// before constructing the response.
-    pub fn into_response(self) -> Response<Body> {
+    pub fn into_response(self) -> Response<Full<Bytes>> {
         let status = self.status_code();
         warn!(
             status = status.as_u16(),
@@ -109,11 +111,11 @@ impl ProxyError {
         Response::builder()
             .status(status)
             .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
+            .body(Full::new(Bytes::from(body.to_string())))
             .unwrap_or_else(|_| {
                 Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(Body::empty())
+                    .body(Full::new(Bytes::new()))
                     .expect("building fallback response must not fail")
             })
     }

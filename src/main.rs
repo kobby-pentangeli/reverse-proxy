@@ -1,9 +1,14 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Client, Response, Server};
-use reverse_proxy::{Config, ProxyError, handle_request};
+use http_body_util::BodyExt;
+use hyper::Response;
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper_util::rt::TokioIo;
+use reverse_proxy::{BoxBody, Config, ProxyError, build_client, handle_request};
+use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -42,62 +47,98 @@ async fn main() {
     let concurrency_limit = config.max_concurrent_requests;
 
     let config = Arc::new(config);
+    let client = build_client(&config);
     let addr = SocketAddr::from(([127, 0, 0, 1], 8100));
 
-    let client = Client::builder()
-        .http1_title_case_headers(true)
-        .http1_preserve_header_case(true)
-        .pool_idle_timeout(config.pool_idle_timeout)
-        .pool_max_idle_per_host(config.pool_max_idle_per_host)
-        .build_http();
-
-    let make_service = make_service_fn(move |conn: &hyper::server::conn::AddrStream| {
-        let client = client.clone();
-        let config = Arc::clone(&config);
-        let semaphore = Arc::clone(&semaphore);
-        let client_addr = conn.remote_addr();
-        async move {
-            Ok::<_, std::convert::Infallible>(service_fn(move |req| {
-                let client = client.clone();
-                let config = Arc::clone(&config);
-                let semaphore = Arc::clone(&semaphore);
-                async move {
-                    let _permit = match semaphore.try_acquire() {
-                        Ok(permit) => permit,
-                        Err(_) => {
-                            warn!(
-                                limit = concurrency_limit,
-                                "concurrency limit reached, rejecting request"
-                            );
-                            let err = ProxyError::ServiceUnavailable {
-                                limit: concurrency_limit,
-                            };
-                            return Ok::<Response<Body>, std::convert::Infallible>(
-                                err.into_response(),
-                            );
-                        }
-                    };
-
-                    let resp = handle_request(req, client, config, client_addr)
-                        .await
-                        .unwrap_or_else(|e| e.into_response());
-                    Ok::<Response<Body>, std::convert::Infallible>(resp)
-                }
-            }))
-        }
+    let listener = TcpListener::bind(addr).await.unwrap_or_else(|e| {
+        error!(%e, %addr, "failed to bind");
+        std::process::exit(1);
     });
-
-    let server = Server::bind(&addr)
-        .http1_preserve_header_case(true)
-        .http1_title_case_headers(true)
-        .serve(make_service);
 
     info!(%addr, "listening");
 
-    let graceful = server.with_graceful_shutdown(shutdown_signal());
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
 
-    if let Err(e) = graceful.await {
-        error!(%e, "server terminated with error");
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                let (stream, client_addr) = match result {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        warn!(%e, "failed to accept connection");
+                        continue;
+                    }
+                };
+
+                let client = client.clone();
+                let config = Arc::clone(&config);
+                let semaphore = Arc::clone(&semaphore);
+
+                tokio::spawn(async move {
+                    let service = service_fn(move |req: hyper::Request<Incoming>| {
+                        let client = client.clone();
+                        let config = Arc::clone(&config);
+                        let semaphore = Arc::clone(&semaphore);
+                        async move {
+                            let _permit = match semaphore.try_acquire() {
+                                Ok(permit) => permit,
+                                Err(_) => {
+                                    warn!(
+                                        limit = concurrency_limit,
+                                        "concurrency limit reached, rejecting request"
+                                    );
+                                    let err = ProxyError::ServiceUnavailable {
+                                        limit: concurrency_limit,
+                                    };
+                                    return Ok::<Response<BoxBody>, std::convert::Infallible>(
+                                        err.into_response().map(|b| {
+                                            b.map_err(
+                                                |never| -> Box<
+                                                    dyn std::error::Error + Send + Sync,
+                                                > {
+                                                    match never {}
+                                                },
+                                            )
+                                            .boxed()
+                                        }),
+                                    );
+                                }
+                            };
+
+                            let resp = handle_request(req, client, config, client_addr)
+                                .await
+                                .unwrap_or_else(|e| {
+                                    e.into_response().map(|b| {
+                                        b.map_err(
+                                            |never| -> Box<
+                                                dyn std::error::Error + Send + Sync,
+                                            > {
+                                                match never {}
+                                            },
+                                        )
+                                        .boxed()
+                                    })
+                                });
+                            Ok::<Response<BoxBody>, std::convert::Infallible>(resp)
+                        }
+                    });
+
+                    if let Err(e) = http1::Builder::new()
+                        .preserve_header_case(true)
+                        .title_case_headers(true)
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await
+                    {
+                        warn!(%e, "connection error");
+                    }
+                });
+            }
+            () = &mut shutdown => {
+                info!("shutting down, no longer accepting connections");
+                break;
+            }
+        }
     }
 
     info!("shutdown complete");

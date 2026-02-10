@@ -9,9 +9,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Client, Method, Request, Response, Server, StatusCode};
-use reverse_proxy::{Config, HttpClient, RuntimeConfig, handle_request};
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode};
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use reverse_proxy::{BoxBody, Config, HttpClient, RuntimeConfig, handle_request};
+use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 /// A synthetic client address used in all test invocations.
@@ -39,36 +45,40 @@ async fn start_backend(
 ) -> (SocketAddr, oneshot::Sender<()>) {
     let (tx, rx) = oneshot::channel::<()>();
 
-    let make_svc = make_service_fn(move |_| {
-        let body = body;
-        let content_type = content_type;
-        let status = status;
-        async move {
-            Ok::<_, std::convert::Infallible>(service_fn(move |_req: Request<Body>| {
-                let body = body;
-                let content_type = content_type;
-                let status = status;
-                async move {
-                    Ok::<_, std::convert::Infallible>(
-                        Response::builder()
-                            .status(status)
-                            .header("content-type", content_type)
-                            .body(Body::from(body))
-                            .expect("test response must build"),
-                    )
-                }
-            }))
-        }
-    });
-
-    let server = Server::bind(&SocketAddr::from(([127, 0, 0, 1], 0))).serve(make_svc);
-    let addr = server.local_addr();
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("failed to bind test backend");
+    let addr = listener.local_addr().unwrap();
 
     tokio::spawn(async move {
-        let graceful = server.with_graceful_shutdown(async {
+        let mut shutdown = std::pin::pin!(async {
             let _ = rx.await;
         });
-        let _ = graceful.await;
+
+        loop {
+            tokio::select! {
+                result = listener.accept() => {
+                    let (stream, _) = result.expect("accept failed");
+                    let service = service_fn(move |_req: Request<Incoming>| {
+                        async move {
+                            Ok::<_, std::convert::Infallible>(
+                                Response::builder()
+                                    .status(status)
+                                    .header("content-type", content_type)
+                                    .body(Full::new(Bytes::from(body)))
+                                    .expect("test response must build"),
+                            )
+                        }
+                    });
+                    tokio::spawn(async move {
+                        let _ = http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), service)
+                            .await;
+                    });
+                }
+                () = &mut shutdown => break,
+            }
+        }
     });
 
     (addr, tx)
@@ -79,34 +89,46 @@ async fn start_backend(
 async fn start_echo_headers_backend() -> (SocketAddr, oneshot::Sender<()>) {
     let (tx, rx) = oneshot::channel::<()>();
 
-    let make_svc = make_service_fn(|_| async {
-        Ok::<_, std::convert::Infallible>(service_fn(|req: Request<Body>| async move {
-            let mut lines = Vec::new();
-            for (name, value) in req.headers() {
-                if let Ok(v) = value.to_str() {
-                    lines.push(format!("{}: {}", name.as_str(), v));
-                }
-            }
-            lines.sort();
-            let body = lines.join("\n");
-            Ok::<_, std::convert::Infallible>(
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "text/plain")
-                    .body(Body::from(body))
-                    .expect("test response must build"),
-            )
-        }))
-    });
-
-    let server = Server::bind(&SocketAddr::from(([127, 0, 0, 1], 0))).serve(make_svc);
-    let addr = server.local_addr();
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("failed to bind test backend");
+    let addr = listener.local_addr().unwrap();
 
     tokio::spawn(async move {
-        let graceful = server.with_graceful_shutdown(async {
+        let mut shutdown = std::pin::pin!(async {
             let _ = rx.await;
         });
-        let _ = graceful.await;
+
+        loop {
+            tokio::select! {
+                result = listener.accept() => {
+                    let (stream, _) = result.expect("accept failed");
+                    let service = service_fn(|req: Request<Incoming>| async move {
+                        let mut lines = Vec::new();
+                        for (name, value) in req.headers() {
+                            if let Ok(v) = value.to_str() {
+                                lines.push(format!("{}: {}", name.as_str(), v));
+                            }
+                        }
+                        lines.sort();
+                        let body = lines.join("\n");
+                        Ok::<_, std::convert::Infallible>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header("content-type", "text/plain")
+                                .body(Full::new(Bytes::from(body)))
+                                .expect("test response must build"),
+                        )
+                    });
+                    tokio::spawn(async move {
+                        let _ = http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), service)
+                            .await;
+                    });
+                }
+                () = &mut shutdown => break,
+            }
+        }
     });
 
     (addr, tx)
@@ -116,30 +138,84 @@ async fn start_echo_headers_backend() -> (SocketAddr, oneshot::Sender<()>) {
 async fn start_leaky_backend() -> (SocketAddr, oneshot::Sender<()>) {
     let (tx, rx) = oneshot::channel::<()>();
 
-    let make_svc = make_service_fn(|_| async {
-        Ok::<_, std::convert::Infallible>(service_fn(|_req: Request<Body>| async {
-            Ok::<_, std::convert::Infallible>(
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "text/plain")
-                    .header("server", "Apache/2.4.52")
-                    .header("x-powered-by", "PHP/8.1")
-                    .header("connection", "keep-alive")
-                    .header("keep-alive", "timeout=5")
-                    .body(Body::from("ok"))
-                    .expect("test response must build"),
-            )
-        }))
-    });
-
-    let server = Server::bind(&SocketAddr::from(([127, 0, 0, 1], 0))).serve(make_svc);
-    let addr = server.local_addr();
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("failed to bind test backend");
+    let addr = listener.local_addr().unwrap();
 
     tokio::spawn(async move {
-        let graceful = server.with_graceful_shutdown(async {
+        let mut shutdown = std::pin::pin!(async {
             let _ = rx.await;
         });
-        let _ = graceful.await;
+
+        loop {
+            tokio::select! {
+                result = listener.accept() => {
+                    let (stream, _) = result.expect("accept failed");
+                    let service = service_fn(|_req: Request<Incoming>| async {
+                        Ok::<_, std::convert::Infallible>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header("content-type", "text/plain")
+                                .header("server", "Apache/2.4.52")
+                                .header("x-powered-by", "PHP/8.1")
+                                .header("connection", "keep-alive")
+                                .header("keep-alive", "timeout=5")
+                                .body(Full::new(Bytes::from("ok")))
+                                .expect("test response must build"),
+                        )
+                    });
+                    tokio::spawn(async move {
+                        let _ = http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), service)
+                            .await;
+                    });
+                }
+                () = &mut shutdown => break,
+            }
+        }
+    });
+
+    (addr, tx)
+}
+
+/// Starts a backend that sleeps for the given duration before responding.
+async fn start_slow_backend(delay: Duration) -> (SocketAddr, oneshot::Sender<()>) {
+    let (tx, rx) = oneshot::channel::<()>();
+
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("failed to bind test backend");
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let mut shutdown = std::pin::pin!(async {
+            let _ = rx.await;
+        });
+
+        loop {
+            tokio::select! {
+                result = listener.accept() => {
+                    let (stream, _) = result.expect("accept failed");
+                    let service = service_fn(move |_req: Request<Incoming>| async move {
+                        tokio::time::sleep(delay).await;
+                        Ok::<_, std::convert::Infallible>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header("content-type", "text/plain")
+                                .body(Full::new(Bytes::from("slow")))
+                                .expect("test response must build"),
+                        )
+                    });
+                    tokio::spawn(async move {
+                        let _ = http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), service)
+                            .await;
+                    });
+                }
+                () = &mut shutdown => break,
+            }
+        }
     });
 
     (addr, tx)
@@ -186,8 +262,31 @@ fn test_config_with_body_limit(addr: SocketAddr, limit: u64) -> Arc<RuntimeConfi
     )
 }
 
+/// Builds a `RuntimeConfig` with a short request timeout for testing.
+fn test_config_with_timeout(addr: SocketAddr, timeout_ms: u64) -> Arc<RuntimeConfig> {
+    Arc::new(
+        Config {
+            upstream: format!("http://{addr}"),
+            request_timeout_ms: Some(timeout_ms),
+            ..Default::default()
+        }
+        .into_runtime()
+        .expect("test config must be valid"),
+    )
+}
+
 fn test_client() -> HttpClient {
-    Client::new()
+    Client::builder(TokioExecutor::new())
+        .build(hyper_util::client::legacy::connect::HttpConnector::new())
+}
+
+/// Collects a [`BoxBody`] into [`Bytes`], mapping any body error to a
+/// descriptive panic so test assertions remain concise.
+async fn collect_body(body: BoxBody) -> Bytes {
+    body.collect()
+        .await
+        .expect("failed to collect response body")
+        .to_bytes()
 }
 
 #[tokio::test]
@@ -199,14 +298,14 @@ async fn get_request_forwards_to_upstream() {
     let req = Request::builder()
         .method(Method::GET)
         .uri(format!("http://{addr}/path?q=1"))
-        .body(Body::empty())
+        .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 
     let resp = handle_request(req, test_client(), config, test_addr())
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let body = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+    let body = collect_body(resp.into_body()).await;
     assert_eq!(body, Bytes::from("hello"));
 }
 
@@ -221,7 +320,7 @@ async fn post_request_forwards_without_inspection() {
         .method(Method::POST)
         .uri(format!("http://{addr}/resource"))
         .header("x-blocked", "should-not-matter-for-post")
-        .body(Body::from(r#"{"name":"test"}"#))
+        .body(Full::new(Bytes::from(r#"{"name":"test"}"#)))
         .unwrap();
 
     let resp = handle_request(req, test_client(), config, test_addr())
@@ -239,7 +338,7 @@ async fn put_request_forwards_without_inspection() {
     let req = Request::builder()
         .method(Method::PUT)
         .uri(format!("http://{addr}/resource/1"))
-        .body(Body::from("new content"))
+        .body(Full::new(Bytes::from("new content")))
         .unwrap();
 
     let resp = handle_request(req, test_client(), config, test_addr())
@@ -257,7 +356,7 @@ async fn delete_request_forwards_without_inspection() {
     let req = Request::builder()
         .method(Method::DELETE)
         .uri(format!("http://{addr}/resource/1"))
-        .body(Body::empty())
+        .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 
     let resp = handle_request(req, test_client(), config, test_addr())
@@ -276,7 +375,7 @@ async fn get_blocked_header_returns_403() {
         .method(Method::GET)
         .uri(format!("http://{addr}/"))
         .header("x-blocked", "present")
-        .body(Body::empty())
+        .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 
     let resp = handle_request(req, test_client(), config, test_addr())
@@ -295,7 +394,7 @@ async fn get_blocked_param_returns_403() {
     let req = Request::builder()
         .method(Method::GET)
         .uri(format!("http://{addr}/?secret_key=abc"))
-        .body(Body::empty())
+        .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 
     let resp = handle_request(req, test_client(), config, test_addr())
@@ -319,13 +418,13 @@ async fn response_body_masking_replaces_sensitive_params() {
     let req = Request::builder()
         .method(Method::GET)
         .uri(format!("http://{addr}/"))
-        .body(Body::empty())
+        .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 
     let resp = handle_request(req, test_client(), config, test_addr())
         .await
         .unwrap();
-    let body = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+    let body = collect_body(resp.into_body()).await;
     let body_str = String::from_utf8_lossy(&body);
 
     assert!(body_str.contains("password=****"));
@@ -347,13 +446,13 @@ async fn response_body_not_masked_for_json_content_type() {
     let req = Request::builder()
         .method(Method::GET)
         .uri(format!("http://{addr}/"))
-        .body(Body::empty())
+        .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 
     let resp = handle_request(req, test_client(), config, test_addr())
         .await
         .unwrap();
-    let body = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+    let body = collect_body(resp.into_body()).await;
     assert_eq!(body, Bytes::from(r#"{"password":"secret"}"#));
 }
 
@@ -375,13 +474,13 @@ async fn no_masking_when_mask_rules_empty() {
     let req = Request::builder()
         .method(Method::GET)
         .uri(format!("http://{addr}/"))
-        .body(Body::empty())
+        .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 
     let resp = handle_request(req, test_client(), config, test_addr())
         .await
         .unwrap();
-    let body = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+    let body = collect_body(resp.into_body()).await;
     assert_eq!(body, Bytes::from("password=visible"));
 }
 
@@ -394,7 +493,7 @@ async fn upstream_preserves_status_code() {
     let req = Request::builder()
         .method(Method::GET)
         .uri(format!("http://{addr}/missing"))
-        .body(Body::empty())
+        .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 
     let resp = handle_request(req, test_client(), config, test_addr())
@@ -414,7 +513,7 @@ async fn smuggling_attempt_returns_400() {
         .uri(format!("http://{addr}/"))
         .header("content-length", "5")
         .header("transfer-encoding", "chunked")
-        .body(Body::from("hello"))
+        .body(Full::new(Bytes::from("hello")))
         .unwrap();
 
     let resp = handle_request(req, test_client(), config, test_addr())
@@ -434,7 +533,7 @@ async fn body_too_large_returns_413() {
         .method(Method::POST)
         .uri(format!("http://{addr}/"))
         .header("content-length", "1000")
-        .body(Body::from("x".repeat(1000)))
+        .body(Full::new(Bytes::from("x".repeat(1000))))
         .unwrap();
 
     let resp = handle_request(req, test_client(), config, test_addr())
@@ -454,7 +553,7 @@ async fn body_within_limit_succeeds() {
         .method(Method::POST)
         .uri(format!("http://{addr}/"))
         .header("content-length", "5")
-        .body(Body::from("hello"))
+        .body(Full::new(Bytes::from("hello")))
         .unwrap();
 
     let resp = handle_request(req, test_client(), config, test_addr())
@@ -473,13 +572,13 @@ async fn forwarding_headers_injected_to_upstream() {
         .method(Method::GET)
         .uri(format!("http://{addr}/test"))
         .header("host", "client-facing.example.com")
-        .body(Body::empty())
+        .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 
     let resp = handle_request(req, test_client(), config, test_addr())
         .await
         .unwrap();
-    let body = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+    let body = collect_body(resp.into_body()).await;
     let body_str = String::from_utf8_lossy(&body);
 
     assert!(
@@ -506,13 +605,13 @@ async fn host_header_rewritten_to_upstream() {
         .method(Method::GET)
         .uri(format!("http://{addr}/"))
         .header("host", "original-host.com")
-        .body(Body::empty())
+        .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 
     let resp = handle_request(req, test_client(), config, test_addr())
         .await
         .unwrap();
-    let body = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+    let body = collect_body(resp.into_body()).await;
     let body_str = String::from_utf8_lossy(&body);
 
     assert!(
@@ -534,13 +633,13 @@ async fn hop_by_hop_headers_stripped_from_request() {
         .header("keep-alive", "timeout=5")
         .header("proxy-authorization", "Bearer token123")
         .header("x-custom", "preserved")
-        .body(Body::empty())
+        .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 
     let resp = handle_request(req, test_client(), config, test_addr())
         .await
         .unwrap();
-    let body = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+    let body = collect_body(resp.into_body()).await;
     let body_str = String::from_utf8_lossy(&body);
 
     assert!(
@@ -570,7 +669,7 @@ async fn response_strips_internal_and_hop_by_hop_headers() {
     let req = Request::builder()
         .method(Method::GET)
         .uri(format!("http://{addr}/"))
-        .body(Body::empty())
+        .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 
     let resp = handle_request(req, test_client(), config, test_addr())
@@ -596,55 +695,6 @@ async fn response_strips_internal_and_hop_by_hop_headers() {
     assert!(resp.headers().contains_key("content-type"));
 }
 
-/// Starts a backend that sleeps for the given duration before responding.
-async fn start_slow_backend(delay: Duration) -> (SocketAddr, oneshot::Sender<()>) {
-    let (tx, rx) = oneshot::channel::<()>();
-
-    let make_svc = make_service_fn(move |_| {
-        let delay = delay;
-        async move {
-            Ok::<_, std::convert::Infallible>(service_fn(move |_req: Request<Body>| {
-                let delay = delay;
-                async move {
-                    tokio::time::sleep(delay).await;
-                    Ok::<_, std::convert::Infallible>(
-                        Response::builder()
-                            .status(StatusCode::OK)
-                            .header("content-type", "text/plain")
-                            .body(Body::from("slow"))
-                            .expect("test response must build"),
-                    )
-                }
-            }))
-        }
-    });
-
-    let server = Server::bind(&SocketAddr::from(([127, 0, 0, 1], 0))).serve(make_svc);
-    let addr = server.local_addr();
-
-    tokio::spawn(async move {
-        let graceful = server.with_graceful_shutdown(async {
-            let _ = rx.await;
-        });
-        let _ = graceful.await;
-    });
-
-    (addr, tx)
-}
-
-/// Builds a `RuntimeConfig` with a short request timeout for testing.
-fn test_config_with_timeout(addr: SocketAddr, timeout_ms: u64) -> Arc<RuntimeConfig> {
-    Arc::new(
-        Config {
-            upstream: format!("http://{addr}"),
-            request_timeout_ms: Some(timeout_ms),
-            ..Default::default()
-        }
-        .into_runtime()
-        .expect("test config must be valid"),
-    )
-}
-
 #[tokio::test]
 async fn request_timeout_returns_504() {
     init_tracing();
@@ -654,7 +704,7 @@ async fn request_timeout_returns_504() {
     let req = Request::builder()
         .method(Method::GET)
         .uri(format!("http://{addr}/"))
-        .body(Body::empty())
+        .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 
     let resp = handle_request(req, test_client(), config, test_addr())
@@ -673,13 +723,13 @@ async fn request_within_timeout_succeeds() {
     let req = Request::builder()
         .method(Method::GET)
         .uri(format!("http://{addr}/"))
-        .body(Body::empty())
+        .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 
     let resp = handle_request(req, test_client(), config, test_addr())
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let body = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+    let body = collect_body(resp.into_body()).await;
     assert_eq!(body, Bytes::from("slow"));
 }
