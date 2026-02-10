@@ -27,9 +27,15 @@ async fn get_request_forwards_to_upstream() {
         .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 
-    let resp = handle_request(req, test_client(), config, test_addr())
-        .await
-        .unwrap();
+    let resp = handle_request(
+        req,
+        test_client(),
+        config.clone(),
+        test_balancer(&config),
+        test_addr(),
+    )
+    .await
+    .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = collect_body(resp.into_body()).await;
     assert_eq!(body, Bytes::from("hello"));
@@ -49,9 +55,15 @@ async fn post_request_forwards_without_inspection() {
         .body(Full::new(Bytes::from(r#"{"name":"test"}"#)))
         .unwrap();
 
-    let resp = handle_request(req, test_client(), config, test_addr())
-        .await
-        .unwrap();
+    let resp = handle_request(
+        req,
+        test_client(),
+        config.clone(),
+        test_balancer(&config),
+        test_addr(),
+    )
+    .await
+    .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 }
 
@@ -67,9 +79,15 @@ async fn put_request_forwards_without_inspection() {
         .body(Full::new(Bytes::from("new content")))
         .unwrap();
 
-    let resp = handle_request(req, test_client(), config, test_addr())
-        .await
-        .unwrap();
+    let resp = handle_request(
+        req,
+        test_client(),
+        config.clone(),
+        test_balancer(&config),
+        test_addr(),
+    )
+    .await
+    .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
@@ -85,9 +103,15 @@ async fn delete_request_forwards_without_inspection() {
         .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 
-    let resp = handle_request(req, test_client(), config, test_addr())
-        .await
-        .unwrap();
+    let resp = handle_request(
+        req,
+        test_client(),
+        config.clone(),
+        test_balancer(&config),
+        test_addr(),
+    )
+    .await
+    .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 }
 
@@ -103,9 +127,15 @@ async fn upstream_preserves_status_code() {
         .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 
-    let resp = handle_request(req, test_client(), config, test_addr())
-        .await
-        .unwrap();
+    let resp = handle_request(
+        req,
+        test_client(),
+        config.clone(),
+        test_balancer(&config),
+        test_addr(),
+    )
+    .await
+    .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
@@ -122,10 +152,16 @@ async fn get_blocked_header_returns_403() {
         .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 
-    let resp = handle_request(req, test_client(), config, test_addr())
-        .await
-        .unwrap_err()
-        .into_response();
+    let resp = handle_request(
+        req,
+        test_client(),
+        config.clone(),
+        test_balancer(&config),
+        test_addr(),
+    )
+    .await
+    .unwrap_err()
+    .into_response();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
@@ -141,10 +177,16 @@ async fn get_blocked_param_returns_403() {
         .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 
-    let resp = handle_request(req, test_client(), config, test_addr())
-        .await
-        .unwrap_err()
-        .into_response();
+    let resp = handle_request(
+        req,
+        test_client(),
+        config.clone(),
+        test_balancer(&config),
+        test_addr(),
+    )
+    .await
+    .unwrap_err()
+    .into_response();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
@@ -165,9 +207,15 @@ async fn response_body_masking_replaces_sensitive_params() {
         .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 
-    let resp = handle_request(req, test_client(), config, test_addr())
-        .await
-        .unwrap();
+    let resp = handle_request(
+        req,
+        test_client(),
+        config.clone(),
+        test_balancer(&config),
+        test_addr(),
+    )
+    .await
+    .unwrap();
     let body = collect_body(resp.into_body()).await;
     let body_str = String::from_utf8_lossy(&body);
 
@@ -193,9 +241,15 @@ async fn response_body_not_masked_for_json_content_type() {
         .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 
-    let resp = handle_request(req, test_client(), config, test_addr())
-        .await
-        .unwrap();
+    let resp = handle_request(
+        req,
+        test_client(),
+        config.clone(),
+        test_balancer(&config),
+        test_addr(),
+    )
+    .await
+    .unwrap();
     let body = collect_body(resp.into_body()).await;
     assert_eq!(body, Bytes::from(r#"{"password":"secret"}"#));
 }
@@ -207,7 +261,7 @@ async fn no_masking_when_mask_rules_empty() {
 
     let config = Arc::new(
         Config {
-            upstream: format!("http://{addr}"),
+            upstreams: single_upstream(addr),
             masked_params: vec![],
             ..Default::default()
         }
@@ -221,9 +275,15 @@ async fn no_masking_when_mask_rules_empty() {
         .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 
-    let resp = handle_request(req, test_client(), config, test_addr())
-        .await
-        .unwrap();
+    let resp = handle_request(
+        req,
+        test_client(),
+        config.clone(),
+        test_balancer(&config),
+        test_addr(),
+    )
+    .await
+    .unwrap();
     let body = collect_body(resp.into_body()).await;
     assert_eq!(body, Bytes::from("password=visible"));
 }
@@ -242,10 +302,16 @@ async fn smuggling_attempt_returns_400() {
         .body(Full::new(Bytes::from("hello")))
         .unwrap();
 
-    let resp = handle_request(req, test_client(), config, test_addr())
-        .await
-        .unwrap_err()
-        .into_response();
+    let resp = handle_request(
+        req,
+        test_client(),
+        config.clone(),
+        test_balancer(&config),
+        test_addr(),
+    )
+    .await
+    .unwrap_err()
+    .into_response();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -262,10 +328,16 @@ async fn body_too_large_returns_413() {
         .body(Full::new(Bytes::from("x".repeat(1000))))
         .unwrap();
 
-    let resp = handle_request(req, test_client(), config, test_addr())
-        .await
-        .unwrap_err()
-        .into_response();
+    let resp = handle_request(
+        req,
+        test_client(),
+        config.clone(),
+        test_balancer(&config),
+        test_addr(),
+    )
+    .await
+    .unwrap_err()
+    .into_response();
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
@@ -282,9 +354,15 @@ async fn body_within_limit_succeeds() {
         .body(Full::new(Bytes::from("hello")))
         .unwrap();
 
-    let resp = handle_request(req, test_client(), config, test_addr())
-        .await
-        .unwrap();
+    let resp = handle_request(
+        req,
+        test_client(),
+        config.clone(),
+        test_balancer(&config),
+        test_addr(),
+    )
+    .await
+    .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
@@ -301,9 +379,15 @@ async fn forwarding_headers_injected_to_upstream() {
         .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 
-    let resp = handle_request(req, test_client(), config, test_addr())
-        .await
-        .unwrap();
+    let resp = handle_request(
+        req,
+        test_client(),
+        config.clone(),
+        test_balancer(&config),
+        test_addr(),
+    )
+    .await
+    .unwrap();
     let body = collect_body(resp.into_body()).await;
     let body_str = String::from_utf8_lossy(&body);
 
@@ -334,9 +418,15 @@ async fn host_header_rewritten_to_upstream() {
         .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 
-    let resp = handle_request(req, test_client(), config, test_addr())
-        .await
-        .unwrap();
+    let resp = handle_request(
+        req,
+        test_client(),
+        config.clone(),
+        test_balancer(&config),
+        test_addr(),
+    )
+    .await
+    .unwrap();
     let body = collect_body(resp.into_body()).await;
     let body_str = String::from_utf8_lossy(&body);
 
@@ -362,9 +452,15 @@ async fn hop_by_hop_headers_stripped_from_request() {
         .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 
-    let resp = handle_request(req, test_client(), config, test_addr())
-        .await
-        .unwrap();
+    let resp = handle_request(
+        req,
+        test_client(),
+        config.clone(),
+        test_balancer(&config),
+        test_addr(),
+    )
+    .await
+    .unwrap();
     let body = collect_body(resp.into_body()).await;
     let body_str = String::from_utf8_lossy(&body);
 
@@ -398,9 +494,15 @@ async fn response_strips_internal_and_hop_by_hop_headers() {
         .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 
-    let resp = handle_request(req, test_client(), config, test_addr())
-        .await
-        .unwrap();
+    let resp = handle_request(
+        req,
+        test_client(),
+        config.clone(),
+        test_balancer(&config),
+        test_addr(),
+    )
+    .await
+    .unwrap();
 
     assert!(
         !resp.headers().contains_key("server"),
@@ -433,10 +535,16 @@ async fn request_timeout_returns_504() {
         .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 
-    let resp = handle_request(req, test_client(), config, test_addr())
-        .await
-        .unwrap_err()
-        .into_response();
+    let resp = handle_request(
+        req,
+        test_client(),
+        config.clone(),
+        test_balancer(&config),
+        test_addr(),
+    )
+    .await
+    .unwrap_err()
+    .into_response();
     assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
 }
 
@@ -452,9 +560,15 @@ async fn request_within_timeout_succeeds() {
         .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 
-    let resp = handle_request(req, test_client(), config, test_addr())
-        .await
-        .unwrap();
+    let resp = handle_request(
+        req,
+        test_client(),
+        config.clone(),
+        test_balancer(&config),
+        test_addr(),
+    )
+    .await
+    .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = collect_body(resp.into_body()).await;
     assert_eq!(body, Bytes::from("slow"));

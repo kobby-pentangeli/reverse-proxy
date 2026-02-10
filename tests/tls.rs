@@ -19,7 +19,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, StatusCode};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use reverse_proxy::{Config, TlsConfig, handle_request};
+use reverse_proxy::{Config, TlsConfig, UpstreamConfig, handle_request};
 use tokio::net::TcpListener;
 
 #[tokio::test]
@@ -37,7 +37,10 @@ async fn tls_origination_forwards_to_https_upstream() {
 
     let config = Arc::new(
         Config {
-            upstream: format!("https://localhost:{}", addr.port()),
+            upstreams: vec![UpstreamConfig {
+                address: format!("https://localhost:{}", addr.port()),
+                weight: 1,
+            }],
             ..Default::default()
         }
         .into_runtime()
@@ -52,7 +55,8 @@ async fn tls_origination_forwards_to_https_upstream() {
         .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 
-    let resp = handle_request(req, client, config, test_addr())
+    let balancer = test_balancer(&config);
+    let resp = handle_request(req, client, config, balancer, test_addr())
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -112,13 +116,17 @@ async fn tls_termination_serves_https_connection() {
 
     let config = Arc::new(
         Config {
-            upstream: format!("http://{backend_addr}"),
+            upstreams: vec![UpstreamConfig {
+                address: format!("http://{backend_addr}"),
+                weight: 1,
+            }],
             ..Default::default()
         }
         .into_runtime()
         .expect("test config"),
     );
     let client = test_client();
+    let balancer = test_balancer(&config);
 
     tokio::spawn(async move {
         let (stream, client_addr) = listener.accept().await.unwrap();
@@ -128,8 +136,9 @@ async fn tls_termination_serves_https_connection() {
         let service = service_fn(move |req: Request<Incoming>| {
             let client = client.clone();
             let config = Arc::clone(&config);
+            let balancer = balancer.clone();
             async move {
-                let resp = handle_request(req, client, config, client_addr)
+                let resp = handle_request(req, client, config, balancer, client_addr)
                     .await
                     .unwrap_or_else(|e| {
                         e.into_response().map(|b| {

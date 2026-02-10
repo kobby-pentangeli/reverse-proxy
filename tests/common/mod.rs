@@ -19,7 +19,9 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use reverse_proxy::{BoxBody, Config, HttpClient, RuntimeConfig};
+use reverse_proxy::{
+    BoxBody, Config, HttpClient, LoadBalancer, RuntimeConfig, UpstreamConfig, UpstreamPool,
+};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
@@ -52,11 +54,19 @@ pub async fn collect_body(body: BoxBody) -> Bytes {
         .to_bytes()
 }
 
+/// Wraps a single address into the upstream config list.
+pub fn single_upstream(addr: SocketAddr) -> Vec<UpstreamConfig> {
+    vec![UpstreamConfig {
+        address: format!("http://{addr}"),
+        weight: 1,
+    }]
+}
+
 /// Builds a `RuntimeConfig` targeting the given local backend address.
 pub fn test_config(addr: SocketAddr) -> Arc<RuntimeConfig> {
     Arc::new(
         Config {
-            upstream: format!("http://{addr}"),
+            upstreams: single_upstream(addr),
             blocked_headers: vec!["x-blocked".into()],
             blocked_params: vec!["secret_key".into()],
             masked_params: vec!["password".into(), "ssn".into()],
@@ -71,7 +81,7 @@ pub fn test_config(addr: SocketAddr) -> Arc<RuntimeConfig> {
 pub fn test_config_with_stripping(addr: SocketAddr) -> Arc<RuntimeConfig> {
     Arc::new(
         Config {
-            upstream: format!("http://{addr}"),
+            upstreams: single_upstream(addr),
             strip_response_headers: vec!["server".into(), "x-powered-by".into()],
             ..Default::default()
         }
@@ -84,7 +94,7 @@ pub fn test_config_with_stripping(addr: SocketAddr) -> Arc<RuntimeConfig> {
 pub fn test_config_with_body_limit(addr: SocketAddr, limit: u64) -> Arc<RuntimeConfig> {
     Arc::new(
         Config {
-            upstream: format!("http://{addr}"),
+            upstreams: single_upstream(addr),
             max_body_size: Some(limit),
             ..Default::default()
         }
@@ -97,13 +107,19 @@ pub fn test_config_with_body_limit(addr: SocketAddr, limit: u64) -> Arc<RuntimeC
 pub fn test_config_with_timeout(addr: SocketAddr, timeout_ms: u64) -> Arc<RuntimeConfig> {
     Arc::new(
         Config {
-            upstream: format!("http://{addr}"),
+            upstreams: single_upstream(addr),
             request_timeout_ms: Some(timeout_ms),
             ..Default::default()
         }
         .into_runtime()
         .expect("test config must be valid"),
     )
+}
+
+/// Builds a [`LoadBalancer`] backed by the upstream(s) in the given config.
+pub fn test_balancer(config: &RuntimeConfig) -> LoadBalancer {
+    let pool = UpstreamPool::from_validated(&config.upstreams);
+    LoadBalancer::new(pool)
 }
 
 /// Starts a local HTTP server that responds to every request with the given
