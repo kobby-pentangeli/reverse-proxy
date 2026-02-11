@@ -12,7 +12,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use common::*;
 use hyper::{Method, Request, StatusCode};
-use reverse_proxy::{Config, LoadBalancer, UpstreamConfig, UpstreamPool, handle_request};
+use reverse_proxy::{
+    Config, LoadBalancer, TimeoutsConfig, UpstreamConfig, UpstreamPool, handle_request,
+};
 
 #[tokio::test]
 async fn requests_distributed_across_multiple_backends() {
@@ -158,7 +160,10 @@ async fn unhealthy_backend_is_skipped() {
                     weight: 1,
                 },
             ],
-            request_timeout_ms: Some(500),
+            timeouts: TimeoutsConfig {
+                request: 1,
+                ..Default::default()
+            },
             ..Default::default()
         }
         .into_runtime()

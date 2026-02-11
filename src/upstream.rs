@@ -30,6 +30,8 @@ struct InnerState {
     weight: u32,
     /// Number of consecutive failures observed.
     consecutive_failures: AtomicU32,
+    /// Number of consecutive successes observed while unhealthy.
+    consecutive_successes: AtomicU32,
     /// Whether this backend is currently considered healthy.
     healthy: AtomicBool,
 }
@@ -73,6 +75,7 @@ impl UpstreamState {
                 uri: backend.uri.clone(),
                 weight: backend.weight,
                 consecutive_failures: AtomicU32::new(0),
+                consecutive_successes: AtomicU32::new(0),
                 healthy: AtomicBool::new(true),
             }),
         }
@@ -93,19 +96,45 @@ impl UpstreamState {
         self.state.healthy.load(Ordering::Acquire)
     }
 
-    /// Records a successful request, resetting the failure counter and
-    /// marking the backend healthy.
-    pub fn record_success(&self) {
+    /// Records a successful health check probe, resetting the failure counter
+    /// and incrementing consecutive successes. When the backend is unhealthy
+    /// and consecutive successes reach `healthy_threshold`, the backend is
+    /// promoted back to healthy status.
+    ///
+    /// Returns `true` if this success caused a health transition from
+    /// unhealthy to healthy.
+    pub fn record_success(&self, healthy_threshold: u32) -> bool {
         self.state.consecutive_failures.store(0, Ordering::Release);
-        self.state.healthy.store(true, Ordering::Release);
+
+        if self.is_healthy() {
+            self.state.consecutive_successes.store(0, Ordering::Release);
+            return false;
+        }
+
+        let prev = self
+            .state
+            .consecutive_successes
+            .fetch_add(1, Ordering::AcqRel);
+        let new_count = prev.saturating_add(1);
+
+        if new_count >= healthy_threshold {
+            self.state.consecutive_successes.store(0, Ordering::Release);
+            self.state.healthy.store(true, Ordering::Release);
+            return true;
+        }
+
+        false
     }
 
-    /// Records a failed request, incrementing the consecutive failure counter.
-    /// If the counter reaches `threshold`, the backend is marked unhealthy.
+    /// Records a failed request, incrementing the consecutive failure counter
+    /// and resetting consecutive successes. If the failure counter reaches
+    /// `threshold`, the backend is marked unhealthy.
     ///
     /// Returns `true` if this failure caused a health transition from
     /// healthy to unhealthy.
     pub fn record_failure(&self, threshold: u32) -> bool {
+        self.state.consecutive_successes.store(0, Ordering::Release);
+
         let prev = self
             .state
             .consecutive_failures
@@ -119,14 +148,16 @@ impl UpstreamState {
         false
     }
 
-    /// Marks this backend as healthy, resetting the failure counter.
+    /// Marks this backend as healthy, resetting both counters.
     pub fn mark_healthy(&self) {
         self.state.consecutive_failures.store(0, Ordering::Release);
+        self.state.consecutive_successes.store(0, Ordering::Release);
         self.state.healthy.store(true, Ordering::Release);
     }
 
-    /// Marks this backend as unhealthy.
+    /// Marks this backend as unhealthy, resetting the success counter.
     pub fn mark_unhealthy(&self) {
+        self.state.consecutive_successes.store(0, Ordering::Release);
         self.state.healthy.store(false, Ordering::Release);
     }
 
@@ -161,9 +192,36 @@ mod tests {
         state.record_failure(5);
         assert_eq!(state.failure_count(), 2);
 
-        state.record_success();
+        state.record_success(1);
         assert_eq!(state.failure_count(), 0);
         assert!(state.is_healthy());
+    }
+
+    #[test]
+    fn record_success_requires_threshold_for_recovery() {
+        let state = UpstreamState::new(&test_upstream("http://localhost:3000", 1));
+        state.mark_unhealthy();
+
+        assert!(!state.record_success(3));
+        assert!(!state.is_healthy());
+        assert!(!state.record_success(3));
+        assert!(!state.is_healthy());
+        assert!(state.record_success(3));
+        assert!(state.is_healthy());
+    }
+
+    #[test]
+    fn failure_resets_consecutive_successes() {
+        let state = UpstreamState::new(&test_upstream("http://localhost:3000", 1));
+        state.mark_unhealthy();
+
+        state.record_success(3);
+        state.record_success(3);
+        state.record_failure(10);
+        assert!(!state.is_healthy());
+
+        state.record_success(3);
+        assert!(!state.is_healthy());
     }
 
     #[test]

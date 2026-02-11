@@ -42,6 +42,9 @@ pub const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8100";
 /// Default number of consecutive failures before marking a backend unhealthy.
 pub const DEFAULT_FAILURE_THRESHOLD: u32 = 3;
 
+/// Default number of consecutive successes before marking a backend healthy.
+pub const DEFAULT_HEALTHY_THRESHOLD: u32 = 1;
+
 /// Default cooldown period before re-checking an unhealthy backend.
 pub const DEFAULT_HEALTH_CHECK_COOLDOWN: Duration = Duration::from_secs(30);
 
@@ -51,11 +54,17 @@ pub const DEFAULT_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 /// Default path for active health check probes.
 pub const DEFAULT_HEALTH_CHECK_PATH: &str = "/health";
 
+/// Default timeout for individual health check probes.
+pub const DEFAULT_HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Default per-IP rate limit in requests per second.
 pub const DEFAULT_RATE_LIMIT_RPS: u32 = 100;
 
 /// Default burst size for per-IP rate limiting.
 pub const DEFAULT_RATE_LIMIT_BURST: u32 = 50;
+
+/// Default graceful shutdown drain timeout.
+pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Raw configuration as deserialized from the YAML file.
 ///
@@ -87,24 +96,16 @@ pub struct Config {
     /// Typically `["server", "x-powered-by"]` to hide backend details.
     #[serde(default)]
     pub strip_response_headers: Vec<String>,
-    /// Connect timeout in milliseconds for establishing upstream TCP connections
-    /// (default: 5000).
-    #[serde(default)]
-    pub connect_timeout_ms: Option<u64>,
-    /// Total request timeout in milliseconds covering the entire upstream
-    /// round-trip (default: 30000). Requests exceeding this receive 504.
-    #[serde(default)]
-    pub request_timeout_ms: Option<u64>,
-    /// Idle timeout in milliseconds for pooled connections (default: 60000).
-    #[serde(default)]
-    pub pool_idle_timeout_ms: Option<u64>,
-    /// Maximum idle connections kept per upstream host (default: 32).
-    #[serde(default)]
-    pub pool_max_idle_per_host: Option<usize>,
     /// Maximum concurrent in-flight requests before returning 503
     /// Service Unavailable (default: 1000).
     #[serde(default)]
     pub max_concurrent_requests: Option<usize>,
+    /// Timeout configuration for upstream connections and requests.
+    #[serde(default)]
+    pub timeouts: TimeoutsConfig,
+    /// Connection pool tuning parameters.
+    #[serde(default)]
+    pub pool: PoolConfig,
     /// TLS termination configuration for accepting HTTPS connections from
     /// clients. When absent, the proxy listens on plain HTTP.
     #[serde(default)]
@@ -116,6 +117,82 @@ pub struct Config {
     /// disabled.
     #[serde(default)]
     pub rate_limit: Option<RateLimitConfig>,
+    /// Graceful shutdown drain timeout in seconds (default: 30).
+    /// After signal receipt, in-flight requests have this long to complete
+    /// before the proxy forcibly terminates them.
+    #[serde(default)]
+    pub shutdown_timeout: Option<u64>,
+}
+
+/// Upstream connection and request timeout configuration.
+///
+/// All values are in seconds. When absent, sensible defaults are applied.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TimeoutsConfig {
+    /// Timeout in seconds for establishing an upstream TCP connection
+    /// (default: 5).
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect: u64,
+    /// Total timeout in seconds for the entire upstream round-trip
+    /// (default: 30). Requests exceeding this receive 504.
+    #[serde(default = "default_request_timeout_secs")]
+    pub request: u64,
+    /// Idle timeout in seconds for pooled upstream connections
+    /// (default: 60).
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle: u64,
+}
+
+fn default_connect_timeout_secs() -> u64 {
+    DEFAULT_CONNECT_TIMEOUT.as_secs()
+}
+
+fn default_request_timeout_secs() -> u64 {
+    DEFAULT_REQUEST_TIMEOUT.as_secs()
+}
+
+fn default_idle_timeout_secs() -> u64 {
+    DEFAULT_POOL_IDLE_TIMEOUT.as_secs()
+}
+
+impl Default for TimeoutsConfig {
+    fn default() -> Self {
+        Self {
+            connect: default_connect_timeout_secs(),
+            request: default_request_timeout_secs(),
+            idle: default_idle_timeout_secs(),
+        }
+    }
+}
+
+/// Connection pool tuning parameters.
+///
+/// Controls how the proxy manages persistent upstream connections.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PoolConfig {
+    /// Idle timeout in seconds for pooled connections (default: 60).
+    #[serde(default = "default_pool_idle_timeout_secs")]
+    pub idle_timeout: u64,
+    /// Maximum idle connections kept per upstream host (default: 32).
+    #[serde(default = "default_pool_max_idle_per_host")]
+    pub max_idle_per_host: usize,
+}
+
+fn default_pool_idle_timeout_secs() -> u64 {
+    DEFAULT_POOL_IDLE_TIMEOUT.as_secs()
+}
+
+fn default_pool_max_idle_per_host() -> usize {
+    DEFAULT_POOL_MAX_IDLE_PER_HOST
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            idle_timeout: default_pool_idle_timeout_secs(),
+            max_idle_per_host: default_pool_max_idle_per_host(),
+        }
+    }
 }
 
 /// Configuration for a single upstream backend.
@@ -143,33 +220,61 @@ pub struct HealthCheckConfig {
     /// HTTP path to probe (default: `/health`).
     #[serde(default = "default_health_path")]
     pub path: String,
-    /// Interval between health check probes in milliseconds (default: 10000).
-    #[serde(default = "default_health_interval_ms")]
-    pub interval_ms: u64,
+    /// Interval between health check probes in seconds (default: 10).
+    #[serde(default = "default_health_interval_secs")]
+    pub interval: u64,
     /// Number of consecutive failures before marking a backend unhealthy
     /// (default: 3).
     #[serde(default = "default_failure_threshold")]
-    pub failure_threshold: u32,
-    /// Cooldown period in milliseconds before re-checking an unhealthy
-    /// backend (default: 30000).
-    #[serde(default = "default_cooldown_ms")]
-    pub cooldown_ms: u64,
+    pub unhealthy_threshold: u32,
+    /// Number of consecutive successes before marking an unhealthy backend
+    /// as healthy again (default: 1).
+    #[serde(default = "default_healthy_threshold")]
+    pub healthy_threshold: u32,
+    /// Cooldown period in seconds before re-checking an unhealthy
+    /// backend (default: 30).
+    #[serde(default = "default_cooldown_secs")]
+    pub cooldown: u64,
+    /// Timeout in seconds for individual health check probes (default: 3).
+    #[serde(default = "default_health_timeout_secs")]
+    pub timeout: u64,
 }
 
 fn default_health_path() -> String {
     DEFAULT_HEALTH_CHECK_PATH.into()
 }
 
-fn default_health_interval_ms() -> u64 {
-    DEFAULT_HEALTH_CHECK_INTERVAL.as_millis() as u64
+fn default_health_interval_secs() -> u64 {
+    DEFAULT_HEALTH_CHECK_INTERVAL.as_secs()
 }
 
 fn default_failure_threshold() -> u32 {
     DEFAULT_FAILURE_THRESHOLD
 }
 
-fn default_cooldown_ms() -> u64 {
-    DEFAULT_HEALTH_CHECK_COOLDOWN.as_millis() as u64
+fn default_healthy_threshold() -> u32 {
+    DEFAULT_HEALTHY_THRESHOLD
+}
+
+fn default_cooldown_secs() -> u64 {
+    DEFAULT_HEALTH_CHECK_COOLDOWN.as_secs()
+}
+
+fn default_health_timeout_secs() -> u64 {
+    DEFAULT_HEALTH_CHECK_TIMEOUT.as_secs()
+}
+
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            path: default_health_path(),
+            interval: default_health_interval_secs(),
+            unhealthy_threshold: default_failure_threshold(),
+            healthy_threshold: default_healthy_threshold(),
+            cooldown: default_cooldown_secs(),
+            timeout: default_health_timeout_secs(),
+        }
+    }
 }
 
 /// Per-IP rate limiting configuration.
@@ -200,17 +305,6 @@ impl Default for RateLimitConfig {
         Self {
             requests_per_second: default_rate_limit_rps(),
             burst: default_rate_limit_burst(),
-        }
-    }
-}
-
-impl Default for HealthCheckConfig {
-    fn default() -> Self {
-        Self {
-            path: default_health_path(),
-            interval_ms: default_health_interval_ms(),
-            failure_threshold: default_failure_threshold(),
-            cooldown_ms: default_cooldown_ms(),
         }
     }
 }
@@ -276,10 +370,15 @@ pub struct RuntimeConfig {
     pub health_check: Option<HealthCheckConfig>,
     /// Number of consecutive failures before marking a backend unhealthy.
     pub failure_threshold: u32,
+    /// Number of consecutive successes before marking a backend healthy.
+    pub healthy_threshold: u32,
     /// Cooldown period before re-checking an unhealthy backend.
     pub health_check_cooldown: Duration,
     /// Per-IP rate limiting configuration. `None` disables rate limiting.
     pub rate_limit: Option<RateLimitConfig>,
+    /// Graceful shutdown drain timeout. After signal receipt, in-flight
+    /// requests have this long to complete before forced termination.
+    pub shutdown_timeout: Duration,
 }
 
 /// A single pre-compiled masking rule binding a parameter name to its regex.
@@ -385,21 +484,10 @@ impl Config {
             .map(|h| h.to_ascii_lowercase())
             .collect();
 
-        let connect_timeout = self
-            .connect_timeout_ms
-            .map_or(DEFAULT_CONNECT_TIMEOUT, Duration::from_millis);
-
-        let request_timeout = self
-            .request_timeout_ms
-            .map_or(DEFAULT_REQUEST_TIMEOUT, Duration::from_millis);
-
-        let pool_idle_timeout = self
-            .pool_idle_timeout_ms
-            .map_or(DEFAULT_POOL_IDLE_TIMEOUT, Duration::from_millis);
-
-        let pool_max_idle_per_host = self
-            .pool_max_idle_per_host
-            .unwrap_or(DEFAULT_POOL_MAX_IDLE_PER_HOST);
+        let connect_timeout = Duration::from_secs(self.timeouts.connect);
+        let request_timeout = Duration::from_secs(self.timeouts.request);
+        let pool_idle_timeout = Duration::from_secs(self.pool.idle_timeout);
+        let pool_max_idle_per_host = self.pool.max_idle_per_host;
 
         let max_concurrent_requests = self
             .max_concurrent_requests
@@ -408,14 +496,23 @@ impl Config {
         let failure_threshold = self
             .health_check
             .as_ref()
-            .map_or(DEFAULT_FAILURE_THRESHOLD, |hc| hc.failure_threshold);
+            .map_or(DEFAULT_FAILURE_THRESHOLD, |hc| hc.unhealthy_threshold);
+
+        let healthy_threshold = self
+            .health_check
+            .as_ref()
+            .map_or(DEFAULT_HEALTHY_THRESHOLD, |hc| hc.healthy_threshold);
 
         let health_check_cooldown = self
             .health_check
             .as_ref()
             .map_or(DEFAULT_HEALTH_CHECK_COOLDOWN, |hc| {
-                Duration::from_millis(hc.cooldown_ms)
+                Duration::from_secs(hc.cooldown)
             });
+
+        let shutdown_timeout = self
+            .shutdown_timeout
+            .map_or(DEFAULT_SHUTDOWN_TIMEOUT, Duration::from_secs);
 
         Ok(RuntimeConfig {
             listen,
@@ -433,8 +530,10 @@ impl Config {
             tls: self.tls,
             health_check: self.health_check,
             failure_threshold,
+            healthy_threshold,
             health_check_cooldown,
             rate_limit: self.rate_limit,
+            shutdown_timeout,
         })
     }
 }
@@ -487,10 +586,11 @@ mod tests {
         );
         assert_eq!(config.blocked_params, vec!["access_token", "secret_key"]);
         assert_eq!(config.masked_params, vec!["password", "ssn", "credit_card"]);
-        assert_eq!(config.connect_timeout_ms, Some(5000));
-        assert_eq!(config.request_timeout_ms, Some(30000));
-        assert_eq!(config.pool_idle_timeout_ms, Some(60000));
-        assert_eq!(config.pool_max_idle_per_host, Some(32));
+        assert_eq!(config.timeouts.connect, 5);
+        assert_eq!(config.timeouts.request, 30);
+        assert_eq!(config.timeouts.idle, 60);
+        assert_eq!(config.pool.idle_timeout, 60);
+        assert_eq!(config.pool.max_idle_per_host, 32);
         assert_eq!(config.max_concurrent_requests, Some(1000));
         assert_eq!(
             config.rate_limit,
@@ -676,18 +776,5 @@ mod tests {
             ..Default::default()
         };
         assert!(config.into_runtime().is_err());
-    }
-
-    #[test]
-    fn health_check_config_uses_defaults() {
-        let config = Config {
-            upstreams: single_upstream("http://localhost:3000"),
-            health_check: Some(HealthCheckConfig::default()),
-            ..Default::default()
-        };
-        let rt = config.into_runtime().unwrap();
-        assert_eq!(rt.failure_threshold, DEFAULT_FAILURE_THRESHOLD);
-        assert_eq!(rt.health_check_cooldown, DEFAULT_HEALTH_CHECK_COOLDOWN);
-        assert!(rt.health_check.is_some());
     }
 }

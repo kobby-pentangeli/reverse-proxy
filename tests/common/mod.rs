@@ -104,11 +104,21 @@ pub fn test_config_with_body_limit(addr: SocketAddr, limit: u64) -> Arc<RuntimeC
 }
 
 /// Builds a `RuntimeConfig` with a short request timeout for testing.
+///
+/// `timeout_ms` is accepted in milliseconds for test ergonomics but
+/// converted to whole seconds (rounded up) for the config layer.
 pub fn test_config_with_timeout(addr: SocketAddr, timeout_ms: u64) -> Arc<RuntimeConfig> {
+    use reverse_proxy::TimeoutsConfig;
+
+    let timeout_secs = timeout_ms.div_ceil(1000).max(1);
+
     Arc::new(
         Config {
             upstreams: single_upstream(addr),
-            request_timeout_ms: Some(timeout_ms),
+            timeouts: TimeoutsConfig {
+                request: timeout_secs,
+                ..Default::default()
+            },
             ..Default::default()
         }
         .into_runtime()

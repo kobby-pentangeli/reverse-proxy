@@ -17,6 +17,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 use crate::{BoxBody, IpRateLimiter, LoadBalancer, ProxyError, RuntimeConfig, handle_request};
@@ -43,8 +44,8 @@ pub struct ServerState {
 /// plain-HTTP and HTTPS upstreams use the same accept loop.
 ///
 /// Runs until `shutdown` resolves, then stops accepting new connections
-/// and returns. In-flight requests on already-spawned tasks continue
-/// to completion independently.
+/// and waits up to `shutdown_timeout` for in-flight requests to drain.
+/// Any connections still active after the deadline are dropped.
 pub async fn serve<C>(
     listener: TcpListener,
     client: hyper_util::client::legacy::Client<C, BoxBody>,
@@ -62,6 +63,9 @@ pub async fn serve<C>(
         tls_acceptor,
     } = state;
 
+    let shutdown_timeout = config.shutdown_timeout;
+    let mut connections = JoinSet::new();
+
     tokio::pin!(shutdown);
 
     loop {
@@ -75,6 +79,10 @@ pub async fn serve<C>(
                     }
                 };
 
+                if let Err(e) = stream.set_nodelay(true) {
+                    warn!(%e, "failed to set TCP_NODELAY");
+                }
+
                 let client = client.clone();
                 let config = Arc::clone(&config);
                 let semaphore = Arc::clone(&semaphore);
@@ -82,7 +90,7 @@ pub async fn serve<C>(
                 let balancer = balancer.clone();
                 let rate_limiter = rate_limiter.clone();
 
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     let svc = service_fn(move |req: hyper::Request<Incoming>| {
                         let client = client.clone();
                         let config = Arc::clone(&config);
@@ -173,16 +181,46 @@ pub async fn serve<C>(
             }
         }
     }
+
+    if !connections.is_empty() {
+        let in_flight = connections.len();
+        info!(
+            in_flight,
+            timeout = ?shutdown_timeout,
+            "draining in-flight connections"
+        );
+
+        let drain_result = tokio::time::timeout(shutdown_timeout, async {
+            while connections.join_next().await.is_some() {}
+        })
+        .await;
+
+        if drain_result.is_err() {
+            let remaining = connections.len();
+            warn!(
+                remaining,
+                "shutdown drain timeout exceeded, aborting remaining connections"
+            );
+            connections.shutdown().await;
+        }
+    }
 }
 
 /// Spawns a background task that periodically probes each upstream backend
 /// at the configured health check path, updating health state based on
 /// HTTP response status.
+///
+/// The `timeout` parameter bounds each individual probe request. Backends
+/// that accumulate `failure_threshold` consecutive failures are marked
+/// unhealthy. Unhealthy backends that accumulate `healthy_threshold`
+/// consecutive successes are promoted back to healthy.
 pub fn spawn_health_checker(
     balancer: LoadBalancer,
     interval: Duration,
     path: &str,
     failure_threshold: u32,
+    healthy_threshold: u32,
+    timeout: Duration,
 ) -> tokio::task::JoinHandle<()> {
     let path = path.to_owned();
     let connector = hyper_util::client::legacy::connect::HttpConnector::new();
@@ -222,13 +260,12 @@ pub fn spawn_health_checker(
                     }
                 };
 
-                let result = tokio::time::timeout(Duration::from_secs(5), client.get(uri)).await;
+                let result = tokio::time::timeout(timeout, client.get(uri)).await;
 
                 match result {
                     Ok(Ok(resp)) if resp.status().is_success() => {
-                        let was_unhealthy = !backend.is_healthy();
-                        backend.record_success();
-                        if was_unhealthy {
+                        let recovered = backend.record_success(healthy_threshold);
+                        if recovered {
                             info!(
                                 upstream = %backend.uri(),
                                 "health check passed, backend recovered"

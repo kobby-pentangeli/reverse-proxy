@@ -132,9 +132,11 @@ async fn main() {
     let health_check_handle = config.health_check.as_ref().map(|hc| {
         spawn_health_checker(
             balancer.clone(),
-            Duration::from_millis(hc.interval_ms),
+            Duration::from_secs(hc.interval),
             &hc.path,
             config.failure_threshold,
+            config.healthy_threshold,
+            Duration::from_secs(hc.timeout),
         )
     });
 

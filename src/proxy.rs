@@ -206,7 +206,7 @@ where
 
         let mut upstream_resp = match upstream_result {
             Ok(Ok(resp)) => {
-                upstream.record_success();
+                upstream.record_success(config.healthy_threshold);
                 resp
             }
             Ok(Err(e)) => {

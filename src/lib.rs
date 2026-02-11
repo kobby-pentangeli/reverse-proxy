@@ -1,4 +1,4 @@
-//! An HTTP reverse proxy built on [hyper] and [tokio].
+//! An HTTP reverse proxy built on [hyper], [tokio], and [rustls].
 //!
 //! This crate provides the core proxy logic: configuration loading with
 //! pre-compiled regex patterns, request forwarding with body streaming,
@@ -59,6 +59,7 @@
 //!
 //! [hyper]: https://hyper.rs/
 //! [tokio]: https://tokio.rs/
+//! [rustls]: https://docs.rs/rustls
 //! [tracing]: https://docs.rs/tracing
 
 pub mod balancer;
@@ -73,7 +74,8 @@ pub mod upstream;
 
 pub use balancer::LoadBalancer;
 pub use config::{
-    Config, HealthCheckConfig, RateLimitConfig, RuntimeConfig, TlsConfig, UpstreamConfig,
+    Config, HealthCheckConfig, PoolConfig, RateLimitConfig, RuntimeConfig, TimeoutsConfig,
+    TlsConfig, UpstreamConfig,
 };
 pub use error::ProxyError;
 pub use proxy::{
