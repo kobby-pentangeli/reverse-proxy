@@ -5,6 +5,7 @@
 //! and stored alongside the raw config for zero-allocation lookups at
 //! request time.
 
+use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
@@ -35,6 +36,9 @@ pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 1000;
 /// Default weight assigned to upstream backends when none is specified.
 pub const DEFAULT_UPSTREAM_WEIGHT: u32 = 1;
 
+/// Default socket address the proxy binds to.
+pub const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8100";
+
 /// Default number of consecutive failures before marking a backend unhealthy.
 pub const DEFAULT_FAILURE_THRESHOLD: u32 = 3;
 
@@ -60,6 +64,9 @@ pub const DEFAULT_RATE_LIMIT_BURST: u32 = 50;
 /// patterns and validated upstream URIs.
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Config {
+    /// Socket address the proxy listens on (default `"127.0.0.1:8100"`).
+    #[serde(default)]
+    pub listen: Option<String>,
     /// Upstream backends with optional weights and health check config.
     #[serde(default)]
     pub upstreams: Vec<UpstreamConfig>,
@@ -237,6 +244,8 @@ pub struct ValidatedUpstream {
 /// filesystem or compiling regexes on the hot path.
 #[derive(Debug)]
 pub struct RuntimeConfig {
+    /// Socket address the proxy binds to.
+    pub listen: SocketAddr,
     /// Validated upstream backends with their load-balancing weights.
     pub upstreams: Vec<ValidatedUpstream>,
     /// Lowercased header names whose presence triggers a 403 on GET requests.
@@ -335,6 +344,11 @@ impl Config {
             ));
         }
 
+        let listen_str = self.listen.as_deref().unwrap_or(DEFAULT_LISTEN_ADDR);
+        let listen = listen_str.parse::<SocketAddr>().map_err(|e| {
+            ProxyError::Config(format!("invalid listen address \"{listen_str}\": {e}"))
+        })?;
+
         let upstreams = self
             .upstreams
             .iter()
@@ -404,6 +418,7 @@ impl Config {
             });
 
         Ok(RuntimeConfig {
+            listen,
             upstreams,
             blocked_headers,
             blocked_params: self.blocked_params,
@@ -463,6 +478,7 @@ mod tests {
     fn loads_config_from_file() {
         let config = Config::load_from_file("./Config.yml").expect("Config.yml should be loadable");
 
+        assert_eq!(config.listen, Some("127.0.0.1:8100".into()));
         assert_eq!(config.upstreams.len(), 1);
         assert_eq!(config.upstreams[0].address, "http://localhost:3000");
         assert_eq!(
@@ -626,6 +642,40 @@ mod tests {
             rt.mask_sensitive_data(input),
             "user.password=****&other=value"
         );
+    }
+
+    #[test]
+    fn into_runtime_defaults_listen_address() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            ..Default::default()
+        };
+        let rt = config.into_runtime().unwrap();
+        assert_eq!(
+            rt.listen,
+            DEFAULT_LISTEN_ADDR.parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn into_runtime_parses_custom_listen_address() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            listen: Some("0.0.0.0:9090".into()),
+            ..Default::default()
+        };
+        let rt = config.into_runtime().unwrap();
+        assert_eq!(rt.listen, "0.0.0.0:9090".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn into_runtime_rejects_invalid_listen_address() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            listen: Some("not-an-address".into()),
+            ..Default::default()
+        };
+        assert!(config.into_runtime().is_err());
     }
 
     #[test]

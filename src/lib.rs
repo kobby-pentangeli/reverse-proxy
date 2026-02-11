@@ -6,11 +6,56 @@
 //! masking in response bodies, weighted round-robin load balancing with
 //! passive and active health checks, structured observability via [tracing],
 //! configurable timeouts, connection pool tuning, concurrency limiting,
-//! and graceful shutdown.
+//! per-IP rate limiting, and graceful shutdown.
 //!
-//! Every inbound request is assigned a monotonic request ID and wrapped
-//! in a [`tracing::Span`] carrying the request method, URI, and client
+//! Every inbound request is assigned a monotonic request ID, injected
+//! into the response as an `X-Request-Id` header, and wrapped in a
+//! [`tracing::Span`] carrying the request method, URI, and client
 //! address as structured fields.
+//!
+//! # Example
+//!
+//! Load a YAML configuration, build an HTTP client, and forward a single
+//! request programmatically:
+//!
+//! ```rust,no_run
+//! use std::net::SocketAddr;
+//! use std::sync::Arc;
+//!
+//! use reverse_proxy::{
+//!     Config, LoadBalancer, UpstreamPool, build_client, handle_request,
+//! };
+//!
+//! #[tokio::main]
+//! async fn main() {
+//!     let config = Config::load_from_file("Config.yml")
+//!         .and_then(|c| c.into_runtime())
+//!         .expect("valid configuration");
+//!
+//!     let client = build_client(&config);
+//!     let pool = UpstreamPool::from_validated(&config.upstreams);
+//!     let balancer = LoadBalancer::new(pool);
+//!     let config = Arc::new(config);
+//!
+//!     let req = hyper::Request::builder()
+//!         .uri("http://localhost/hello")
+//!         .body(http_body_util::Empty::<bytes::Bytes>::new())
+//!         .unwrap();
+//!
+//!     let resp = handle_request(
+//!         req,
+//!         client,
+//!         config,
+//!         balancer,
+//!         SocketAddr::from(([127, 0, 0, 1], 0)),
+//!         None,
+//!     )
+//!     .await
+//!     .expect("proxy succeeded");
+//!
+//!     println!("status: {}", resp.status());
+//! }
+//! ```
 //!
 //! [hyper]: https://hyper.rs/
 //! [tokio]: https://tokio.rs/

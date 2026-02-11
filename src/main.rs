@@ -1,7 +1,7 @@
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use clap::Parser;
 use reverse_proxy::server::{
     ServerState, serve, shutdown_signal, spawn_health_checker, spawn_rate_limit_cleanup,
 };
@@ -13,18 +13,59 @@ use tokio::sync::Semaphore;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-const CONFIG_FILE_PATH: &str = "./Config.yml";
+/// An HTTP reverse proxy with load balancing, rate limiting, and TLS support.
+#[derive(Parser)]
+#[command(version, about)]
+struct Cli {
+    /// Path to the YAML configuration file.
+    #[arg(short, long, default_value = "./Config.yml")]
+    config: String,
+
+    /// Log output format (pretty | json).
+    #[arg(long, default_value = "pretty")]
+    log_format: LogFormat,
+
+    /// Log verbosity level, overriding the `RUST_LOG` environment variable.
+    #[arg(long)]
+    log_level: Option<String>,
+}
+
+#[derive(Clone, Debug, clap::ValueEnum)]
+enum LogFormat {
+    Pretty,
+    Json,
+}
+
+fn init_tracing(format: &LogFormat, level_override: Option<&str>) {
+    let filter = level_override.map_or_else(
+        || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        EnvFilter::new,
+    );
+
+    match format {
+        LogFormat::Pretty => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .init();
+        }
+        LogFormat::Json => {
+            tracing_subscriber::fmt()
+                .json()
+                .with_env_filter(filter)
+                .with_target(false)
+                .init();
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_target(false)
-        .init();
+    let cli = Cli::parse();
 
-    let config = Config::load_from_file(CONFIG_FILE_PATH)
+    init_tracing(&cli.log_format, cli.log_level.as_deref());
+
+    let config = Config::load_from_file(&cli.config)
         .and_then(|c| c.into_runtime())
         .unwrap_or_else(|e| {
             error!(%e, "failed to load configuration");
@@ -78,8 +119,8 @@ async fn main() {
 
     let semaphore = Arc::new(Semaphore::new(config.max_concurrent_requests));
     let concurrency_limit = config.max_concurrent_requests;
+    let addr = config.listen;
     let config = Arc::new(config);
-    let addr = SocketAddr::from(([127, 0, 0, 1], 8100));
 
     let listener = TcpListener::bind(addr).await.unwrap_or_else(|e| {
         error!(%e, %addr, "failed to bind");

@@ -1,8 +1,8 @@
 //! Integration tests for the core HTTP proxy pipeline.
 //!
 //! Exercises request forwarding, method handling, header/parameter blocking,
-//! response masking, hop-by-hop stripping, body size limits, and timeouts
-//! against throwaway local backends.
+//! response masking, hop-by-hop stripping, body size limits, timeouts, and
+//! `X-Request-Id` injection against throwaway local backends.
 
 mod common;
 
@@ -591,4 +591,87 @@ async fn request_within_timeout_succeeds() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = collect_body(resp.into_body()).await;
     assert_eq!(body, Bytes::from("slow"));
+}
+
+#[tokio::test]
+async fn response_includes_x_request_id() {
+    init_tracing();
+    let (addr, _shutdown) = start_backend(StatusCode::OK, "text/plain", "ok").await;
+    let config = test_config(addr);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("http://{addr}/"))
+        .body(http_body_util::Empty::<Bytes>::new())
+        .unwrap();
+
+    let resp = handle_request(
+        req,
+        test_client(),
+        config.clone(),
+        test_balancer(&config),
+        test_addr(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let request_id = resp
+        .headers()
+        .get("x-request-id")
+        .expect("response must include x-request-id header");
+
+    let id_value = request_id
+        .to_str()
+        .expect("x-request-id must be valid UTF-8")
+        .parse::<u64>()
+        .expect("x-request-id must be a numeric value");
+
+    assert!(id_value > 0, "request id should be a positive integer");
+}
+
+#[tokio::test]
+async fn x_request_id_increments_across_requests() {
+    init_tracing();
+    let (addr, _shutdown) = start_backend(StatusCode::OK, "text/plain", "ok").await;
+    let config = test_config(addr);
+
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("http://{addr}/"))
+            .body(http_body_util::Empty::<Bytes>::new())
+            .unwrap();
+
+        let resp = handle_request(
+            req,
+            test_client(),
+            config.clone(),
+            test_balancer(&config),
+            test_addr(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let id = resp
+            .headers()
+            .get("x-request-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        ids.push(id);
+    }
+
+    assert!(
+        ids[1] > ids[0],
+        "request IDs must be monotonically increasing"
+    );
+    assert!(
+        ids[2] > ids[1],
+        "request IDs must be monotonically increasing"
+    );
 }

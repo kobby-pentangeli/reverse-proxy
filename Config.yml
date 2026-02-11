@@ -1,3 +1,4 @@
+listen: "127.0.0.1:8100"
 upstreams:
   - address: "http://localhost:3000"
     weight: 1

@@ -103,6 +103,9 @@ pub fn build_https_client(config: &RuntimeConfig) -> HttpsClient {
 ///     `Server`, `X-Powered-By`) are removed from the response.
 /// 14. **Response masking** — For text-based upstream responses, sensitive
 ///     parameter values are masked before returning to the client.
+/// 15. **Request ID injection** — An `X-Request-Id` header carrying the
+///     monotonic request ID is added to every response for client-side
+///     log correlation.
 pub async fn handle_request<B, C>(
     req: Request<B>,
     client: Client<C, BoxBody>,
@@ -246,7 +249,12 @@ where
             );
         }
 
-        build_response(upstream_resp, &config).await
+        let mut resp = build_response(upstream_resp, &config).await?;
+        resp.headers_mut().insert(
+            HeaderName::from_static("x-request-id"),
+            hyper::header::HeaderValue::from(request_id),
+        );
+        Ok(resp)
     }
     .instrument(span)
     .await
