@@ -22,11 +22,14 @@ pub mod error;
 pub mod headers;
 pub mod proxy;
 pub mod rate_limit;
+pub mod server;
 pub mod tls;
 pub mod upstream;
 
 pub use balancer::LoadBalancer;
-pub use config::{Config, HealthCheckConfig, RuntimeConfig, TlsConfig, UpstreamConfig};
+pub use config::{
+    Config, HealthCheckConfig, RateLimitConfig, RuntimeConfig, TlsConfig, UpstreamConfig,
+};
 pub use error::ProxyError;
 pub use proxy::{
     BoxBody, HttpClient, HttpsClient, build_client, build_https_client, handle_request,

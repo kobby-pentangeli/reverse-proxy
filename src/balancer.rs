@@ -13,8 +13,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::upstream::{UpstreamPool, UpstreamState};
-use crate::{ProxyError, Result};
+use crate::{ProxyError, Result, UpstreamPool, UpstreamState};
 
 /// A weighted round-robin load balancer over an [`UpstreamPool`].
 ///

@@ -18,8 +18,7 @@ use governor::middleware::NoOpMiddleware;
 use governor::state::keyed::DashMapStateStore;
 use governor::{Quota, RateLimiter};
 
-use crate::config::RateLimitConfig;
-use crate::{ProxyError, Result};
+use crate::{ProxyError, RateLimitConfig, Result};
 
 /// The concrete governor rate limiter type keyed by client IP address.
 type InnerLimiter = RateLimiter<IpAddr, DashMapStateStore<IpAddr>, DefaultClock, NoOpMiddleware>;
