@@ -777,4 +777,90 @@ mod tests {
         };
         assert!(config.into_runtime().is_err());
     }
+
+    #[test]
+    fn health_check_config_uses_defaults() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            health_check: Some(HealthCheckConfig::default()),
+            ..Default::default()
+        };
+        let rt = config.into_runtime().unwrap();
+        assert_eq!(rt.failure_threshold, DEFAULT_FAILURE_THRESHOLD);
+        assert_eq!(rt.healthy_threshold, DEFAULT_HEALTHY_THRESHOLD);
+        assert_eq!(rt.health_check_cooldown, DEFAULT_HEALTH_CHECK_COOLDOWN);
+        assert!(rt.health_check.is_some());
+        let hc = rt.health_check.as_ref().unwrap();
+        assert_eq!(hc.timeout, DEFAULT_HEALTH_CHECK_TIMEOUT.as_secs());
+    }
+
+    #[test]
+    fn timeouts_config_uses_defaults() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            ..Default::default()
+        };
+        let rt = config.into_runtime().unwrap();
+        assert_eq!(rt.connect_timeout, DEFAULT_CONNECT_TIMEOUT);
+        assert_eq!(rt.request_timeout, DEFAULT_REQUEST_TIMEOUT);
+        assert_eq!(rt.pool_idle_timeout, DEFAULT_POOL_IDLE_TIMEOUT);
+        assert_eq!(rt.pool_max_idle_per_host, DEFAULT_POOL_MAX_IDLE_PER_HOST);
+    }
+
+    #[test]
+    fn custom_timeouts_propagate() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            timeouts: TimeoutsConfig {
+                connect: 2,
+                request: 10,
+                idle: 120,
+            },
+            pool: PoolConfig {
+                idle_timeout: 90,
+                max_idle_per_host: 16,
+            },
+            ..Default::default()
+        };
+        let rt = config.into_runtime().unwrap();
+        assert_eq!(rt.connect_timeout, Duration::from_secs(2));
+        assert_eq!(rt.request_timeout, Duration::from_secs(10));
+        assert_eq!(rt.pool_idle_timeout, Duration::from_secs(90));
+        assert_eq!(rt.pool_max_idle_per_host, 16);
+    }
+
+    #[test]
+    fn shutdown_timeout_defaults() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            ..Default::default()
+        };
+        let rt = config.into_runtime().unwrap();
+        assert_eq!(rt.shutdown_timeout, DEFAULT_SHUTDOWN_TIMEOUT);
+    }
+
+    #[test]
+    fn custom_shutdown_timeout() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            shutdown_timeout: Some(10),
+            ..Default::default()
+        };
+        let rt = config.into_runtime().unwrap();
+        assert_eq!(rt.shutdown_timeout, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn healthy_threshold_propagates() {
+        let config = Config {
+            upstreams: single_upstream("http://localhost:3000"),
+            health_check: Some(HealthCheckConfig {
+                healthy_threshold: 5,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let rt = config.into_runtime().unwrap();
+        assert_eq!(rt.healthy_threshold, 5);
+    }
 }
