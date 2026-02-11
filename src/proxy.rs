@@ -24,8 +24,7 @@ use hyper_util::rt::TokioExecutor;
 use tokio::time::timeout;
 use tracing::{Instrument, debug, info, warn};
 
-use crate::balancer::LoadBalancer;
-use crate::{ProxyError, Result, RuntimeConfig, headers, tls};
+use crate::{IpRateLimiter, LoadBalancer, ProxyError, Result, RuntimeConfig, headers, tls};
 
 /// An alias to simplify the calls to `Box<dyn std::error::Error + Send + Sync>`.
 type StdError = Box<dyn std::error::Error + Send + Sync>;
@@ -74,32 +73,35 @@ pub fn build_https_client(config: &RuntimeConfig) -> HttpsClient {
 ///
 /// The pipeline performs the following steps in order:
 ///
-/// 1. **Request smuggling defense** — Rejects requests carrying both
+/// 1. **Rate limiting** — If a rate limiter is configured, the client IP is
+///    checked against the per-IP token bucket. Requests exceeding the limit
+///    receive a 429 Too Many Requests response with a `Retry-After` header.
+/// 2. **Request smuggling defense** — Rejects requests carrying both
 ///    `Content-Length` and `Transfer-Encoding` headers (RFC 7230 §3.3.3).
-/// 2. **Body size enforcement** — Rejects requests whose `Content-Length`
+/// 3. **Body size enforcement** — Rejects requests whose `Content-Length`
 ///    exceeds the configured `max_body_size` with 413 Payload Too Large.
-/// 3. **GET inspection** — If the request method is GET, blocked headers and
+/// 4. **GET inspection** — If the request method is GET, blocked headers and
 ///    query parameters are checked. Requests matching any block rule receive
 ///    a 403 Forbidden response.
-/// 4. **Upstream selection** — The round-robin balancer selects the next
+/// 5. **Upstream selection** — The round-robin balancer selects the next
 ///    healthy backend. If none are available, returns 503.
-/// 5. **Hop-by-hop stripping** — Connection-scoped headers are removed
+/// 6. **Hop-by-hop stripping** — Connection-scoped headers are removed
 ///    before forwarding, per RFC 7230 §6.1.
-/// 6. **Forwarding headers** — `X-Forwarded-For`, `X-Forwarded-Proto`, and
+/// 7. **Forwarding headers** — `X-Forwarded-For`, `X-Forwarded-Proto`, and
 ///    `X-Forwarded-Host` are injected to preserve client origin metadata.
-/// 7. **Host rewriting** — The `Host` header is set to the upstream authority.
-/// 8. **URI rewriting** — The request URI is rewritten to target the selected
+/// 8. **Host rewriting** — The `Host` header is set to the upstream authority.
+/// 9. **URI rewriting** — The request URI is rewritten to target the selected
 ///    upstream, preserving the original path and query string.
-/// 9. **Body streaming** — The request body is passed through to the upstream
-///    without buffering.
-/// 10. **Passive health tracking** — On upstream success, the backend's
+/// 10. **Body streaming** — The request body is passed through to the upstream
+///     without buffering.
+/// 11. **Passive health tracking** — On upstream success, the backend's
 ///     failure counter is reset. On failure/timeout, it is incremented and
 ///     the backend may be marked unhealthy.
-/// 11. **Response hop-by-hop stripping** — Connection-scoped headers are
+/// 12. **Response hop-by-hop stripping** — Connection-scoped headers are
 ///     removed from the upstream response.
-/// 12. **Response header stripping** — Configured internal headers (e.g.
+/// 13. **Response header stripping** — Configured internal headers (e.g.
 ///     `Server`, `X-Powered-By`) are removed from the response.
-/// 13. **Response masking** — For text-based upstream responses, sensitive
+/// 14. **Response masking** — For text-based upstream responses, sensitive
 ///     parameter values are masked before returning to the client.
 pub async fn handle_request<B, C>(
     req: Request<B>,
@@ -107,6 +109,7 @@ pub async fn handle_request<B, C>(
     config: Arc<RuntimeConfig>,
     balancer: LoadBalancer,
     client_addr: SocketAddr,
+    rate_limiter: Option<&IpRateLimiter>,
 ) -> Result<Response<BoxBody>>
 where
     B: hyper::body::Body<Data = Bytes> + Send + Sync + 'static,
@@ -126,6 +129,17 @@ where
     );
 
     async move {
+        if let Some(limiter) = rate_limiter {
+            limiter.check(&client_addr.ip()).map_err(|retry_after_ms| {
+                warn!(
+                    ip = %client_addr.ip(),
+                    retry_after_ms,
+                    "rate limit exceeded"
+                );
+                ProxyError::RateLimited { retry_after_ms }
+            })?;
+        }
+
         if headers::is_smuggling_attempt(req.headers()) {
             warn!("request smuggling attempt detected");
             return Err(ProxyError::RequestSmuggling);

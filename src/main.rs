@@ -9,8 +9,8 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use reverse_proxy::{
-    BoxBody, Config, LoadBalancer, ProxyError, RuntimeConfig, UpstreamPool, build_client,
-    build_https_client, handle_request,
+    BoxBody, Config, IpRateLimiter, LoadBalancer, ProxyError, RuntimeConfig, UpstreamPool,
+    build_client, build_https_client, handle_request,
 };
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
@@ -46,6 +46,15 @@ async fn main() {
     let pool = UpstreamPool::from_validated(&config.upstreams);
     let balancer = LoadBalancer::new(pool);
 
+    let rate_limiter = config.rate_limit.as_ref().map(|rl_cfg| {
+        info!(
+            requests_per_second = rl_cfg.requests_per_second,
+            burst = rl_cfg.burst,
+            "per-IP rate limiting enabled"
+        );
+        IpRateLimiter::from_config(rl_cfg).expect("rate limiter from config should not fail here")
+    });
+
     info!(
         upstreams = config.upstreams.len(),
         blocked_headers = config.blocked_headers.len(),
@@ -58,6 +67,7 @@ async fn main() {
         tls_termination = tls_acceptor.is_some(),
         tls_origination = upstream_is_https,
         active_health_checks = config.health_check.is_some(),
+        rate_limiting = rate_limiter.is_some(),
         "configuration loaded"
     );
 
@@ -91,54 +101,69 @@ async fn main() {
         )
     });
 
+    let cleanup_handle = rate_limiter
+        .as_ref()
+        .map(|rl| spawn_rate_limit_cleanup(rl.clone()));
+
+    let build_state = |rate_limiter| ServeState {
+        config: Arc::clone(&config),
+        balancer: balancer.clone(),
+        semaphore: Arc::clone(&semaphore),
+        concurrency_limit,
+        rate_limiter,
+        tls_acceptor,
+    };
+
     if upstream_is_https {
         let client = build_https_client(&config);
-        serve(
-            listener,
-            tls_acceptor,
-            client,
-            config,
-            balancer,
-            semaphore,
-            concurrency_limit,
-        )
-        .await;
+        serve(listener, client, build_state(rate_limiter)).await;
     } else {
         let client = build_client(&config);
-        serve(
-            listener,
-            tls_acceptor,
-            client,
-            config,
-            balancer,
-            semaphore,
-            concurrency_limit,
-        )
-        .await;
+        serve(listener, client, build_state(rate_limiter)).await;
     }
 
     if let Some(handle) = health_check_handle {
         handle.abort();
     }
 
+    if let Some(handle) = cleanup_handle {
+        handle.abort();
+    }
+
     info!("shutdown complete");
 }
 
-/// Accepts connections on `listener`, optionally wrapping each in TLS via
-/// `tls_acceptor`, and dispatches them through the proxy pipeline using the
-/// given `client` and `balancer`. Generic over the client connector type so
-/// that both plain-HTTP and HTTPS upstreams use the same accept loop.
-async fn serve<C>(
-    listener: TcpListener,
-    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
-    client: hyper_util::client::legacy::Client<C, BoxBody>,
+/// Runtime state shared across the accept loop, bundled to avoid passing
+/// many individual arguments.
+struct ServeState {
     config: Arc<RuntimeConfig>,
     balancer: LoadBalancer,
     semaphore: Arc<Semaphore>,
     concurrency_limit: usize,
+    rate_limiter: Option<IpRateLimiter>,
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+}
+
+/// Accepts connections on `listener`, optionally wrapping each in TLS, and
+/// dispatches them through the proxy pipeline using the given `client` and
+/// shared `state`. Generic over the client connector type so that both
+/// plain-HTTP and HTTPS upstreams use the same accept loop.
+async fn serve<C>(
+    listener: TcpListener,
+    client: hyper_util::client::legacy::Client<C, BoxBody>,
+    state: ServeState,
 ) where
     C: hyper_util::client::legacy::connect::Connect + Clone + Send + Sync + 'static,
 {
+    let ServeState {
+        config,
+        balancer,
+        semaphore,
+        concurrency_limit,
+        rate_limiter,
+        tls_acceptor,
+    } = state;
+
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
 
@@ -158,6 +183,7 @@ async fn serve<C>(
                 let semaphore = Arc::clone(&semaphore);
                 let tls_acceptor = tls_acceptor.clone();
                 let balancer = balancer.clone();
+                let rate_limiter = rate_limiter.clone();
 
                 tokio::spawn(async move {
                     let svc = service_fn(move |req: hyper::Request<Incoming>| {
@@ -165,6 +191,7 @@ async fn serve<C>(
                         let config = Arc::clone(&config);
                         let semaphore = Arc::clone(&semaphore);
                         let balancer = balancer.clone();
+                        let rate_limiter = rate_limiter.clone();
                         async move {
                             let _permit = match semaphore.try_acquire() {
                                 Ok(permit) => permit,
@@ -191,20 +218,27 @@ async fn serve<C>(
                                 }
                             };
 
-                            let resp = handle_request(req, client, config, balancer, client_addr)
-                                .await
-                                .unwrap_or_else(|e| {
-                                    e.into_response().map(|b| {
-                                        b.map_err(
-                                            |never| -> Box<
-                                                dyn std::error::Error + Send + Sync,
-                                            > {
-                                                match never {}
-                                            },
-                                        )
-                                        .boxed()
-                                    })
-                                });
+                            let resp = handle_request(
+                                req,
+                                client,
+                                config,
+                                balancer,
+                                client_addr,
+                                rate_limiter.as_ref(),
+                            )
+                            .await
+                            .unwrap_or_else(|e| {
+                                e.into_response().map(|b| {
+                                    b.map_err(
+                                        |never| -> Box<
+                                            dyn std::error::Error + Send + Sync,
+                                        > {
+                                            match never {}
+                                        },
+                                    )
+                                    .boxed()
+                                })
+                            });
                             Ok::<Response<BoxBody>, std::convert::Infallible>(resp)
                         }
                     });
@@ -330,6 +364,30 @@ fn spawn_health_checker(
                         );
                     }
                 }
+            }
+        }
+    })
+}
+
+/// Spawns a background task that periodically prunes stale entries from the
+/// rate limiter, preventing unbounded memory growth.
+fn spawn_rate_limit_cleanup(limiter: IpRateLimiter) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(60));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            ticker.tick().await;
+            let before = limiter.tracked_ip_count();
+            limiter.retain_recent();
+            let after = limiter.tracked_ip_count();
+            if before != after {
+                info!(
+                    before,
+                    after,
+                    pruned = before - after,
+                    "rate limiter cleanup completed"
+                );
             }
         }
     })

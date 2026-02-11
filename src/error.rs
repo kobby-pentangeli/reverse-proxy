@@ -71,6 +71,13 @@ pub enum ProxyError {
     #[error("tls error: {0}")]
     Tls(String),
 
+    /// The client has exceeded the configured per-IP rate limit.
+    #[error("rate limit exceeded, retry after {retry_after_ms}ms")]
+    RateLimited {
+        /// Suggested wait time in milliseconds before retrying.
+        retry_after_ms: u64,
+    },
+
     /// No healthy upstream backend is available to serve the request.
     #[error("no healthy upstream backend available")]
     NoHealthyUpstream,
@@ -92,6 +99,7 @@ impl ProxyError {
             | Self::InvalidHeaderName(_)
             | Self::Tls(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::NoHealthyUpstream => StatusCode::SERVICE_UNAVAILABLE,
+            Self::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::BlockedHeader(_) | Self::BlockedParam(_) => StatusCode::FORBIDDEN,
             Self::BodyTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Self::RequestSmuggling => StatusCode::BAD_REQUEST,
@@ -113,14 +121,26 @@ impl ProxyError {
             %self,
             "returning error response"
         );
+        let retry_after_ms = match &self {
+            Self::RateLimited { retry_after_ms } => Some(*retry_after_ms),
+            _ => None,
+        };
+
         let body = serde_json::json!({
             "error": self.error_tag(),
             "message": self.to_string(),
         });
 
-        Response::builder()
+        let mut builder = Response::builder()
             .status(status)
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+
+        if let Some(ms) = retry_after_ms {
+            let retry_secs = ms.div_ceil(1000);
+            builder = builder.header("retry-after", retry_secs.to_string());
+        }
+
+        builder
             .body(Full::new(Bytes::from(body.to_string())))
             .unwrap_or_else(|_| {
                 Response::builder()
@@ -146,6 +166,7 @@ impl ProxyError {
                 "http_error"
             }
             Self::Tls(_) => "tls_error",
+            Self::RateLimited { .. } => "rate_limited",
             Self::NoHealthyUpstream => "no_healthy_upstream",
             Self::Internal(_) => "internal_error",
         }

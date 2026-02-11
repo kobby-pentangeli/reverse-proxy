@@ -20,3 +20,6 @@ request_timeout_ms: 30000
 pool_idle_timeout_ms: 60000
 pool_max_idle_per_host: 32
 max_concurrent_requests: 1000
+rate_limit:
+  requests_per_second: 100
+  burst: 50

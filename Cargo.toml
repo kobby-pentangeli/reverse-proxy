@@ -10,6 +10,7 @@ edition = "2024"
 
 [dependencies]
 bytes = "1.11"
+governor = "0.10"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["full"] }
 hyper-rustls = { version = "0.27", default-features = false, features = [

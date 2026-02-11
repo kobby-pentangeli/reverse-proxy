@@ -21,6 +21,7 @@ pub mod config;
 pub mod error;
 pub mod headers;
 pub mod proxy;
+pub mod rate_limit;
 pub mod tls;
 pub mod upstream;
 
@@ -30,6 +31,7 @@ pub use error::ProxyError;
 pub use proxy::{
     BoxBody, HttpClient, HttpsClient, build_client, build_https_client, handle_request,
 };
+pub use rate_limit::IpRateLimiter;
 pub use upstream::{UpstreamPool, UpstreamState};
 
 pub type Result<T> = std::result::Result<T, ProxyError>;

@@ -47,6 +47,12 @@ pub const DEFAULT_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 /// Default path for active health check probes.
 pub const DEFAULT_HEALTH_CHECK_PATH: &str = "/health";
 
+/// Default per-IP rate limit in requests per second.
+pub const DEFAULT_RATE_LIMIT_RPS: u32 = 100;
+
+/// Default burst size for per-IP rate limiting.
+pub const DEFAULT_RATE_LIMIT_BURST: u32 = 50;
+
 /// Raw configuration as deserialized from the YAML file.
 ///
 /// This struct maps directly to the on-disk schema. After loading, it is
@@ -99,6 +105,10 @@ pub struct Config {
     /// Health check configuration for upstream backends.
     #[serde(default)]
     pub health_check: Option<HealthCheckConfig>,
+    /// Per-IP rate limiting configuration. When absent, rate limiting is
+    /// disabled.
+    #[serde(default)]
+    pub rate_limit: Option<RateLimitConfig>,
 }
 
 /// Configuration for a single upstream backend.
@@ -153,6 +163,38 @@ fn default_failure_threshold() -> u32 {
 
 fn default_cooldown_ms() -> u64 {
     DEFAULT_HEALTH_CHECK_COOLDOWN.as_millis() as u64
+}
+
+/// Per-IP rate limiting configuration.
+///
+/// When present, the proxy applies a token-bucket rate limiter keyed by
+/// client IP address. Requests exceeding the limit receive a 429
+/// Too Many Requests response with a `Retry-After` header.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RateLimitConfig {
+    /// Maximum sustained requests per second per client IP (default: 100).
+    #[serde(default = "default_rate_limit_rps")]
+    pub requests_per_second: u32,
+    /// Maximum burst size above the sustained rate (default: 50).
+    #[serde(default = "default_rate_limit_burst")]
+    pub burst: u32,
+}
+
+fn default_rate_limit_rps() -> u32 {
+    DEFAULT_RATE_LIMIT_RPS
+}
+
+fn default_rate_limit_burst() -> u32 {
+    DEFAULT_RATE_LIMIT_BURST
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            requests_per_second: default_rate_limit_rps(),
+            burst: default_rate_limit_burst(),
+        }
+    }
 }
 
 impl Default for HealthCheckConfig {
@@ -227,6 +269,8 @@ pub struct RuntimeConfig {
     pub failure_threshold: u32,
     /// Cooldown period before re-checking an unhealthy backend.
     pub health_check_cooldown: Duration,
+    /// Per-IP rate limiting configuration. `None` disables rate limiting.
+    pub rate_limit: Option<RateLimitConfig>,
 }
 
 /// A single pre-compiled masking rule binding a parameter name to its regex.
@@ -375,6 +419,7 @@ impl Config {
             health_check: self.health_check,
             failure_threshold,
             health_check_cooldown,
+            rate_limit: self.rate_limit,
         })
     }
 }
@@ -431,6 +476,13 @@ mod tests {
         assert_eq!(config.pool_idle_timeout_ms, Some(60000));
         assert_eq!(config.pool_max_idle_per_host, Some(32));
         assert_eq!(config.max_concurrent_requests, Some(1000));
+        assert_eq!(
+            config.rate_limit,
+            Some(RateLimitConfig {
+                requests_per_second: 100,
+                burst: 50,
+            })
+        );
     }
 
     #[test]
