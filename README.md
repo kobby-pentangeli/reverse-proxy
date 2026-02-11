@@ -1,48 +1,143 @@
 # reverse-proxy
 
-An HTTP reverse proxy built on [hyper](https://hyper.rs/) and [tokio](https://tokio.rs/). Accepts client connections, applies policy (header/parameter blocking, sensitive data masking), forwards requests to upstream backends, and streams responses back.
+An HTTP reverse proxy built on [hyper](https://hyper.rs/), [tokio](https://tokio.rs/), and [rustls](https://docs.rs/rustls). Distributes traffic across weighted upstream backends with active and passive health checks, enforces request policies (header/parameter blocking, body size limits, sensitive data masking), and terminates TLS -- all with streaming I/O and zero per-request allocation for config lookups.
+
+## Features
+
+- **Weighted round-robin load balancing** across multiple upstreams
+- **Active and passive health checks** with configurable thresholds and cooldowns
+- **TLS termination** (HTTPS clients) and **TLS origination** (HTTPS upstreams) via rustls
+- **Per-IP rate limiting** (GCRA token bucket) with automatic stale-entry cleanup
+- **Request policy enforcement**: header blocking, query parameter blocking, body size limits
+- **Response body masking** of sensitive parameters (passwords, SSNs, etc.)
+- **Hop-by-hop header stripping** and response header removal (e.g. `Server`, `X-Powered-By`)
+- **HTTP request smuggling defense** (rejects ambiguous `Transfer-Encoding` + `Content-Length`)
+- **Concurrency limiting** with 503 backpressure
+- **Graceful shutdown** with configurable drain timeout
+- **Structured logging** via tracing (pretty or JSON)
+- **Monotonic `X-Request-Id`** on every response
 
 ## Quick Start
 
-- Requires [Rust](https://www.rust-lang.org/tools/install) 1.85 or later (with `rustup`)
-- Cargo (comes with Rust)
+### Prerequisites
 
-1. Clone the repo:
+- [Rust](https://www.rust-lang.org/tools/install) 1.85+ (edition 2024)
+
+### Build and Run
 
 ```bash
 git clone https://github.com/kobby-pentangeli/reverse-proxy.git
 cd reverse-proxy
+cp Config.example.yml Config.yml   # create your local config
+cargo build --release
 ```
 
-2. Configure `Config.yml` at the project root:
+Edit `Config.yml` to point at your backend(s), then start the proxy:
+
+```bash
+cargo run --release
+# or run the binary directly:
+./target/release/reverse-proxy
+```
+
+The proxy listens on `127.0.0.1:8100` by default. Send some requests:
+
+```bash
+# Basic GET — forwarded to an upstream backend
+curl -i http://127.0.0.1:8100/
+
+# POST with a JSON body
+curl -i http://127.0.0.1:8100/api/users \
+  -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"name": "alice"}'
+
+# GET with a blocked query parameter (returns 403)
+curl -i "http://127.0.0.1:8100/search?access_token=secret"
+
+# GET with a blocked header (returns 403)
+curl -i http://127.0.0.1:8100/ -H "X-Debug-Token: abc123"
+
+# Response includes X-Request-Id and stripped internal headers
+curl -si http://127.0.0.1:8100/ | grep -i x-request-id
+```
+
+### CLI Options
+
+```text
+reverse-proxy [OPTIONS]
+
+Options:
+  -c, --config <PATH>        Path to YAML config file [default: ./Config.yml]
+      --log-format <FORMAT>  Log output format: pretty | json [default: pretty]
+      --log-level <LEVEL>    Log verbosity, overrides RUST_LOG [e.g. debug, info]
+  -h, --help                 Print help
+  -V, --version              Print version
+```
+
+## Configuration
+
+All configuration lives in a single YAML file. Below is a complete example with defaults shown:
 
 ```yaml
-upstream: "http://localhost:3000"
+listen: "127.0.0.1:8100"
+
+upstreams:
+  - address: "http://localhost:3000"
+    weight: 1
+  - address: "http://localhost:3001"
+    weight: 2
+
+timeouts:
+  connect: 5       # seconds
+  request: 30      # seconds
+  idle: 60         # seconds
+
+pool:
+  idle_timeout: 60       # seconds
+  max_idle_per_host: 32
+
+max_concurrent_requests: 1000
+max_body_size: 10485760  # 10 MiB
+
 blocked_headers:
-  - User-Agent
-  - X-Forwarded-For
+  - X-Debug-Token
+  - X-Internal-Auth
+
 blocked_params:
   - access_token
   - secret_key
+
 masked_params:
   - password
   - ssn
   - credit_card
+
+strip_response_headers:
+  - server
+  - x-powered-by
+
+health_check:
+  path: /health
+  interval: 10            # seconds
+  unhealthy_threshold: 3
+  healthy_threshold: 1
+  cooldown: 30            # seconds
+  timeout: 3              # seconds
+
+rate_limit:
+  requests_per_second: 100
+  burst: 50
+
+shutdown_timeout: 30  # seconds
+
+# TLS termination (optional)
+# tls:
+#   cert_path: /path/to/cert.pem
+#   key_path: /path/to/key.pem
 ```
 
-3. Run the proxy:
-
-```bash
-cargo run --release
-```
-
-4. Send a request:
-
-```bash
-curl -i http://127.0.0.1:8100/
-```
-
-The proxy listens on `127.0.0.1:8100` and forwards to the configured `upstream`.
+All time values are in **seconds**. Only `listen` and `upstreams` are required; everything else has sensible defaults.
 
 ## Development
 
