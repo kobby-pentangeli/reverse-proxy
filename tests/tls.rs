@@ -56,7 +56,7 @@ async fn tls_origination_forwards_to_https_upstream() {
         .unwrap();
 
     let balancer = test_balancer(&config);
-    let resp = handle_request(req, client, config, balancer, test_addr())
+    let resp = handle_request(req, client, config, balancer, test_addr(), None)
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -138,7 +138,7 @@ async fn tls_termination_serves_https_connection() {
             let config = Arc::clone(&config);
             let balancer = balancer.clone();
             async move {
-                let resp = handle_request(req, client, config, balancer, client_addr)
+                let resp = handle_request(req, client, config, balancer, client_addr, None)
                     .await
                     .unwrap_or_else(|e| {
                         e.into_response().map(|b| {

@@ -33,6 +33,7 @@ async fn get_request_forwards_to_upstream() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        None,
     )
     .await
     .unwrap();
@@ -61,6 +62,7 @@ async fn post_request_forwards_without_inspection() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        None,
     )
     .await
     .unwrap();
@@ -85,6 +87,7 @@ async fn put_request_forwards_without_inspection() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        None,
     )
     .await
     .unwrap();
@@ -109,6 +112,7 @@ async fn delete_request_forwards_without_inspection() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        None,
     )
     .await
     .unwrap();
@@ -133,6 +137,7 @@ async fn upstream_preserves_status_code() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        None,
     )
     .await
     .unwrap();
@@ -158,6 +163,7 @@ async fn get_blocked_header_returns_403() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        None,
     )
     .await
     .unwrap_err()
@@ -183,6 +189,7 @@ async fn get_blocked_param_returns_403() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        None,
     )
     .await
     .unwrap_err()
@@ -213,6 +220,7 @@ async fn response_body_masking_replaces_sensitive_params() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        None,
     )
     .await
     .unwrap();
@@ -247,6 +255,7 @@ async fn response_body_not_masked_for_json_content_type() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        None,
     )
     .await
     .unwrap();
@@ -281,6 +290,7 @@ async fn no_masking_when_mask_rules_empty() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        None,
     )
     .await
     .unwrap();
@@ -308,6 +318,7 @@ async fn smuggling_attempt_returns_400() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        None,
     )
     .await
     .unwrap_err()
@@ -334,6 +345,7 @@ async fn body_too_large_returns_413() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        None,
     )
     .await
     .unwrap_err()
@@ -360,6 +372,7 @@ async fn body_within_limit_succeeds() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        None,
     )
     .await
     .unwrap();
@@ -385,6 +398,7 @@ async fn forwarding_headers_injected_to_upstream() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        None,
     )
     .await
     .unwrap();
@@ -424,6 +438,7 @@ async fn host_header_rewritten_to_upstream() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        None,
     )
     .await
     .unwrap();
@@ -458,6 +473,7 @@ async fn hop_by_hop_headers_stripped_from_request() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        None,
     )
     .await
     .unwrap();
@@ -500,6 +516,7 @@ async fn response_strips_internal_and_hop_by_hop_headers() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        None,
     )
     .await
     .unwrap();
@@ -541,6 +558,7 @@ async fn request_timeout_returns_504() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        None,
     )
     .await
     .unwrap_err()
@@ -566,6 +584,7 @@ async fn request_within_timeout_succeeds() {
         config.clone(),
         test_balancer(&config),
         test_addr(),
+        None,
     )
     .await
     .unwrap();
