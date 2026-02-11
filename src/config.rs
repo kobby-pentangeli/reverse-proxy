@@ -575,14 +575,15 @@ mod tests {
 
     #[test]
     fn loads_config_from_file() {
-        let config = Config::load_from_file("./Config.yml").expect("Config.yml should be loadable");
+        let config = Config::load_from_file("./Config.example.yml")
+            .expect("Config.example.yml should be loadable");
 
         assert_eq!(config.listen, Some("127.0.0.1:8100".into()));
         assert_eq!(config.upstreams.len(), 1);
         assert_eq!(config.upstreams[0].address, "http://localhost:3000");
         assert_eq!(
             config.blocked_headers,
-            vec!["User-Agent", "X-Forwarded-For"]
+            vec!["X-Debug-Token", "X-Internal-Auth"]
         );
         assert_eq!(config.blocked_params, vec!["access_token", "secret_key"]);
         assert_eq!(config.masked_params, vec!["password", "ssn", "credit_card"]);
