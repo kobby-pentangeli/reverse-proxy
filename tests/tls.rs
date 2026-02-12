@@ -6,7 +6,6 @@
 
 mod common;
 
-use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -25,7 +24,7 @@ use tokio::net::TcpListener;
 #[tokio::test]
 async fn tls_origination_forwards_to_https_upstream() {
     init_tracing();
-    let (cert_pem, key_pem, _) = generate_test_cert();
+    let (cert_pem, key_pem) = generate_test_cert();
     let (addr, _shutdown) = start_tls_backend(
         &cert_pem,
         &key_pem,
@@ -66,7 +65,7 @@ async fn tls_origination_forwards_to_https_upstream() {
 
 #[tokio::test]
 async fn tls_termination_acceptor_loads_valid_certs() {
-    let (cert_pem, key_pem, _) = generate_test_cert();
+    let (cert_pem, key_pem) = generate_test_cert();
     let cert_path = write_temp_file("cert", &cert_pem);
     let key_path = write_temp_file("key", &key_pem);
 
@@ -96,7 +95,7 @@ async fn tls_termination_rejects_missing_cert_file() {
 #[tokio::test]
 async fn tls_termination_serves_https_connection() {
     init_tracing();
-    let (cert_pem, key_pem, _) = generate_test_cert();
+    let (cert_pem, key_pem) = generate_test_cert();
     let cert_path = write_temp_file("e2e-cert", &cert_pem);
     let key_path = write_temp_file("e2e-key", &key_pem);
 
@@ -157,9 +156,13 @@ async fn tls_termination_serves_https_connection() {
             .await;
     });
 
-    let cert_der = rustls_pemfile::certs(&mut BufReader::new(cert_pem.as_bytes()))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .unwrap();
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
+
+    let cert_der: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
     let mut root_store = rustls::RootCertStore::empty();
     for cert in &cert_der {
         root_store.add(cert.clone()).unwrap();

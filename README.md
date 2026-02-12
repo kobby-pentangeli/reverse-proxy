@@ -9,18 +9,18 @@ An HTTP reverse proxy built on [hyper](https://hyper.rs/), [tokio](https://tokio
 
 ## Features
 
-- **Weighted round-robin load balancing** across multiple upstreams
-- **Active and passive health checks** with configurable thresholds and cooldowns
-- **TLS termination** (HTTPS clients) and **TLS origination** (HTTPS upstreams) via rustls
-- **Per-IP rate limiting** (GCRA token bucket) with automatic stale-entry cleanup
-- **Request policy enforcement**: header blocking, query parameter blocking, body size limits
-- **Response body masking** of sensitive parameters (passwords, SSNs, etc.)
-- **Hop-by-hop header stripping** and response header removal (e.g. `Server`, `X-Powered-By`)
-- **HTTP request smuggling defense** (rejects ambiguous `Transfer-Encoding` + `Content-Length`)
-- **Concurrency limiting** with 503 backpressure
-- **Graceful shutdown** with configurable drain timeout
-- **Structured logging** via tracing (pretty or JSON)
-- **Monotonic `X-Request-Id`** on every response
+- *Weighted round-robin load balancing* across multiple upstreams
+- *Active and passive health checks* with configurable thresholds and cooldowns
+- *TLS termination* (HTTPS clients) and *TLS origination* (HTTPS upstreams) via rustls
+- *Per-IP rate limiting* (GCRA token bucket) with automatic stale-entry cleanup
+- *Request policy enforcement*: header blocking, query parameter blocking, body size limits
+- *Response body masking* of sensitive parameters (passwords, SSNs, etc.)
+- *Hop-by-hop header stripping* and response header removal (e.g. `Server`, `X-Powered-By`)
+- *HTTP request smuggling defense* (rejects ambiguous `Transfer-Encoding` + `Content-Length`)
+- *Concurrency limiting* with 503 backpressure
+- *Graceful shutdown* with configurable drain timeout
+- *Structured logging* via tracing (pretty or JSON)
+- *Monotonic `X-Request-Id`* on every response
 
 ## Quick Start
 

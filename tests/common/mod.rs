@@ -6,7 +6,6 @@
 
 #![allow(dead_code)]
 
-use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -319,18 +318,18 @@ pub async fn start_slow_backend(delay: Duration) -> (SocketAddr, oneshot::Sender
 }
 
 /// Generates a self-signed certificate and private key for testing.
-/// Returns (certificate PEM, private key PEM, rcgen certified key).
-pub fn generate_test_cert() -> (String, String, rcgen::CertifiedKey) {
+/// Returns (certificate PEM, private key PEM).
+pub fn generate_test_cert() -> (String, String) {
     let subject_alt_names = vec!["localhost".into(), "127.0.0.1".into()];
     let certified_key = rcgen::generate_simple_self_signed(subject_alt_names).unwrap();
     let cert_pem = certified_key.cert.pem();
-    let key_pem = certified_key.key_pair.serialize_pem();
-    (cert_pem, key_pem, certified_key)
+    let key_pem = certified_key.signing_key.serialize_pem();
+    (cert_pem, key_pem)
 }
 
 /// Writes `content` to a temporary file and returns its path.
 pub fn write_temp_file(prefix: &str, content: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join("palisade-test");
+    let dir = std::env::temp_dir().join("reverse-proxy-test");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(format!("{prefix}-{}.pem", std::process::id()));
     std::fs::write(&path, content).unwrap();
@@ -347,14 +346,14 @@ pub async fn start_tls_backend(
 ) -> (SocketAddr, oneshot::Sender<()>) {
     let (tx, rx) = oneshot::channel::<()>();
 
-    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut BufReader::new(cert_pem.as_bytes()))
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-    let key = rustls_pemfile::private_key(&mut BufReader::new(key_pem.as_bytes()))
-        .unwrap()
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+        .collect::<std::result::Result<Vec<_>, _>>()
         .unwrap();
+
+    let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).unwrap();
 
     let server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -408,9 +407,13 @@ pub async fn start_tls_backend(
 
 /// Builds an HTTPS client that trusts the given self-signed certificate.
 pub fn test_https_client(cert_pem: &str) -> palisade::HttpsClient {
-    let cert_der = rustls_pemfile::certs(&mut BufReader::new(cert_pem.as_bytes()))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .unwrap();
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
+
+    let cert_der: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
 
     let mut root_store = rustls::RootCertStore::empty();
     for cert in &cert_der {

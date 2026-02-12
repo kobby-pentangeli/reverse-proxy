@@ -9,10 +9,10 @@
 //! - **Origination (proxy -> upstream):** Initiates HTTPS connections to
 //!   upstream backends using the platform root certificate store.
 
-use std::io::BufReader;
 use std::sync::Arc;
 
 use hyper_rustls::HttpsConnectorBuilder;
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::TlsAcceptor;
 
@@ -59,10 +59,8 @@ pub fn build_https_connector()
 
 /// Loads PEM-encoded X.509 certificates from the file at `path`.
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| ProxyError::Tls(format!("failed to open cert file {path}: {e}")))?;
-
-    rustls_pemfile::certs(&mut BufReader::new(file))
+    CertificateDer::pem_file_iter(path)
+        .map_err(|e| ProxyError::Tls(format!("failed to open cert file {path}: {e}")))?
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| ProxyError::Tls(format!("failed to parse certificates from {path}: {e}")))
 }
@@ -71,28 +69,6 @@ fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
 ///
 /// Supports PKCS#1 (RSA), PKCS#8, and SEC1 (EC) key formats.
 fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| ProxyError::Tls(format!("failed to open key file {path}: {e}")))?;
-
-    let mut reader = BufReader::new(file);
-
-    loop {
-        match rustls_pemfile::read_one(&mut reader)
-            .map_err(|e| ProxyError::Tls(format!("failed to parse key from {path}: {e}")))?
-        {
-            Some(rustls_pemfile::Item::Pkcs8Key(key)) => {
-                return Ok(PrivateKeyDer::Pkcs8(key));
-            }
-            Some(rustls_pemfile::Item::Pkcs1Key(key)) => {
-                return Ok(PrivateKeyDer::Pkcs1(key));
-            }
-            Some(rustls_pemfile::Item::Sec1Key(key)) => {
-                return Ok(PrivateKeyDer::Sec1(key));
-            }
-            Some(_) => continue,
-            None => {
-                return Err(ProxyError::Tls(format!("no private key found in {path}")));
-            }
-        }
-    }
+    PrivateKeyDer::from_pem_file(path)
+        .map_err(|e| ProxyError::Tls(format!("failed to load private key from {path}: {e}")))
 }
