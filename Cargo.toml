@@ -46,5 +46,7 @@ webpki-roots = "1"
 
 [dev-dependencies]
 rcgen = "0.14"
+# Pin time >= 0.3.47 to resolve RUSTSEC-2026-0009 (transitive via rcgen).
+time = "0.3.47"
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
