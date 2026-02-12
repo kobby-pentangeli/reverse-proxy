@@ -1,16 +1,16 @@
 [package]
-name = "reverse-proxy"
+name = "palisade"
 version = "0.1.0"
 description = "An HTTP reverse proxy."
 authors = ["Kobby Pentangeli <kobbypentangeli@gmail.com>"]
-repository = "https://github.com/kobby-pentangeli/reverse-proxy"
-documentation = "https://docs.rs/reverse-proxy"
+repository = "https://github.com/kobby-pentangeli/palisade"
+documentation = "https://docs.rs/palisade"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
 edition = "2024"
 rust-version = "1.85"
 categories = ["network-programming", "web-programming::http-server"]
-keywords = ["proxy", "reverse-proxy", "http", "load-balancer", "hyper"]
+keywords = ["proxy", "palisade", "http", "load-balancer", "hyper"]
 
 [dependencies]
 bytes = "1.11"

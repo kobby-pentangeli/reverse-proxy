@@ -12,7 +12,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use common::*;
 use hyper::{Method, Request, StatusCode};
-use reverse_proxy::{
+use palisade::{
     Config, LoadBalancer, TimeoutsConfig, UpstreamConfig, UpstreamPool, handle_request,
 };
 

@@ -13,7 +13,7 @@ use bytes::Bytes;
 use common::*;
 use http_body_util::Full;
 use hyper::{Method, Request, StatusCode};
-use reverse_proxy::{Config, handle_request};
+use palisade::{Config, handle_request};
 
 #[tokio::test]
 async fn get_request_forwards_to_upstream() {

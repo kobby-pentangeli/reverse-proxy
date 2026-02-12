@@ -2,10 +2,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use reverse_proxy::server::{
+use palisade::server::{
     ServerState, serve, shutdown_signal, spawn_health_checker, spawn_rate_limit_cleanup,
 };
-use reverse_proxy::{
+use palisade::{
     Config, IpRateLimiter, LoadBalancer, UpstreamPool, build_client, build_https_client,
 };
 use tokio::net::TcpListener;
@@ -73,7 +73,7 @@ async fn main() {
         });
 
     let tls_acceptor = config.tls.as_ref().map(|tls_cfg| {
-        reverse_proxy::tls::build_tls_acceptor(tls_cfg).unwrap_or_else(|e| {
+        palisade::tls::build_tls_acceptor(tls_cfg).unwrap_or_else(|e| {
             error!(%e, "failed to initialize TLS");
             std::process::exit(1);
         })

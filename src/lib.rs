@@ -22,7 +22,7 @@
 //! use std::net::SocketAddr;
 //! use std::sync::Arc;
 //!
-//! use reverse_proxy::{
+//! use palisade::{
 //!     Config, LoadBalancer, UpstreamPool, build_client, handle_request,
 //! };
 //!

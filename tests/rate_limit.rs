@@ -12,8 +12,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use bytes::Bytes;
 use common::*;
 use hyper::{Method, Request, StatusCode};
-use reverse_proxy::config::RateLimitConfig;
-use reverse_proxy::{IpRateLimiter, handle_request};
+use palisade::config::RateLimitConfig;
+use palisade::{IpRateLimiter, handle_request};
 
 #[inline]
 fn rate_limiter_from_config(c: &RateLimitConfig) -> IpRateLimiter {

@@ -33,4 +33,4 @@ Initial release.
 - CLI interface via clap with `--config`, `--log-format`, and `--log-level` options
 - Comprehensive test suite: 88 tests (unit + integration) covering all major code paths
 
-[0.1.0]: https://github.com/kobby-pentangeli/reverse-proxy/releases/tag/v0.1.0
+[0.1.0]: https://github.com/kobby-pentangeli/palisade/releases/tag/v0.1.0

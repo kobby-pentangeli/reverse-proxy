@@ -1,4 +1,9 @@
-# reverse-proxy
+# palisade
+
+[![Crates.io](https://img.shields.io/crates/v/palisade.svg)](https://crates.io/crates/palisade)
+[![Documentation](https://docs.rs/palisade/badge.svg)](https://docs.rs/palisade)
+[![CI](https://github.com/kobby-pentangeli/palisade/workflows/CI/badge.svg)](https://github.com/kobby-pentangeli/palisade/actions)
+[![License](https://img.shields.io/crates/l/palisade.svg)](https://github.com/kobby-pentangeli/palisade#license)
 
 An HTTP reverse proxy built on [hyper](https://hyper.rs/), [tokio](https://tokio.rs/), and [rustls](https://docs.rs/rustls). Distributes traffic across weighted upstream backends with active and passive health checks, enforces request policies (header/parameter blocking, body size limits, sensitive data masking), and terminates TLS -- all with streaming I/O and zero per-request allocation for config lookups.
 
@@ -26,8 +31,8 @@ An HTTP reverse proxy built on [hyper](https://hyper.rs/), [tokio](https://tokio
 ### Build and Run
 
 ```bash
-git clone https://github.com/kobby-pentangeli/reverse-proxy.git
-cd reverse-proxy
+git clone https://github.com/kobby-pentangeli/palisade.git
+cd palisade
 cp Config.example.yml Config.yml   # create your local config
 cargo build --release
 ```
@@ -37,7 +42,7 @@ Edit `Config.yml` to point at your backend(s), then start the proxy:
 ```bash
 cargo run --release
 # or run the binary directly:
-./target/release/reverse-proxy
+./target/release/palisade
 ```
 
 The proxy listens on `127.0.0.1:8100` by default. Send some requests:
@@ -65,7 +70,7 @@ curl -si http://127.0.0.1:8100/ | grep -i x-request-id
 ### CLI Options
 
 ```text
-reverse-proxy [OPTIONS]
+palisade [OPTIONS]
 
 Options:
   -c, --config <PATH>        Path to YAML config file [default: ./Config.yml]
@@ -153,11 +158,11 @@ cargo build --release --all-features --all-targets         # release build
 
 All contributions large and small are actively accepted.
 
-- Read the [contribution guidelines](https://github.com/kobby-pentangeli/reverse-proxy/blob/master/CONTRIBUTING.md).
-- Browse [Good First Issues](https://github.com/kobby-pentangeli/reverse-proxy/labels/good%20first%20issue).
+- Read the [contribution guidelines](./CONTRIBUTING.md).
+- Browse [Good First Issues](https://github.com/kobby-pentangeli/palisade/labels/good%20first%20issue).
 
 ## License
 
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.
+Licensed under either of [Apache License, Version 2.0](./LICENSE-APACHE) or [MIT license](./LICENSE-MIT) at your option.
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this codebase by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.

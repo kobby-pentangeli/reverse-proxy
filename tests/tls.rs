@@ -19,7 +19,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, StatusCode};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use reverse_proxy::{Config, TlsConfig, UpstreamConfig, handle_request};
+use palisade::{Config, TlsConfig, UpstreamConfig, handle_request};
 use tokio::net::TcpListener;
 
 #[tokio::test]
@@ -75,7 +75,7 @@ async fn tls_termination_acceptor_loads_valid_certs() {
         key_path: key_path.to_str().unwrap().into(),
     };
 
-    let result = reverse_proxy::tls::build_tls_acceptor(&tls_config);
+    let result = palisade::tls::build_tls_acceptor(&tls_config);
     assert!(result.is_ok(), "should build TLS acceptor from valid certs");
 
     std::fs::remove_file(&cert_path).ok();
@@ -89,7 +89,7 @@ async fn tls_termination_rejects_missing_cert_file() {
         key_path: "/nonexistent/key.pem".into(),
     };
 
-    let result = reverse_proxy::tls::build_tls_acceptor(&tls_config);
+    let result = palisade::tls::build_tls_acceptor(&tls_config);
     assert!(result.is_err(), "should fail with missing cert file");
 }
 
@@ -104,7 +104,7 @@ async fn tls_termination_serves_https_connection() {
         cert_path: cert_path.to_str().unwrap().into(),
         key_path: key_path.to_str().unwrap().into(),
     };
-    let tls_acceptor = reverse_proxy::tls::build_tls_acceptor(&tls_config).unwrap();
+    let tls_acceptor = palisade::tls::build_tls_acceptor(&tls_config).unwrap();
 
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await

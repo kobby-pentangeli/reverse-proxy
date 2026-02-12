@@ -19,7 +19,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use reverse_proxy::{
+use palisade::{
     BoxBody, Config, HttpClient, LoadBalancer, RuntimeConfig, UpstreamConfig, UpstreamPool,
 };
 use tokio::net::TcpListener;
@@ -108,7 +108,7 @@ pub fn test_config_with_body_limit(addr: SocketAddr, limit: u64) -> Arc<RuntimeC
 /// `timeout_ms` is accepted in milliseconds for test ergonomics but
 /// converted to whole seconds (rounded up) for the config layer.
 pub fn test_config_with_timeout(addr: SocketAddr, timeout_ms: u64) -> Arc<RuntimeConfig> {
-    use reverse_proxy::TimeoutsConfig;
+    use palisade::TimeoutsConfig;
 
     let timeout_secs = timeout_ms.div_ceil(1000).max(1);
 
@@ -330,7 +330,7 @@ pub fn generate_test_cert() -> (String, String, rcgen::CertifiedKey) {
 
 /// Writes `content` to a temporary file and returns its path.
 pub fn write_temp_file(prefix: &str, content: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join("reverse-proxy-test");
+    let dir = std::env::temp_dir().join("palisade-test");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(format!("{prefix}-{}.pem", std::process::id()));
     std::fs::write(&path, content).unwrap();
@@ -407,7 +407,7 @@ pub async fn start_tls_backend(
 }
 
 /// Builds an HTTPS client that trusts the given self-signed certificate.
-pub fn test_https_client(cert_pem: &str) -> reverse_proxy::HttpsClient {
+pub fn test_https_client(cert_pem: &str) -> palisade::HttpsClient {
     let cert_der = rustls_pemfile::certs(&mut BufReader::new(cert_pem.as_bytes()))
         .collect::<std::result::Result<Vec<_>, _>>()
         .unwrap();
